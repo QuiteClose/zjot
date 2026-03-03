@@ -9,6 +9,7 @@ const CellAlign = node_mod.CellAlign;
 const attrs_mod = @import("attributes.zig");
 const BlockAttrs = attrs_mod.BlockAttrs;
 const inline_mod = @import("inline.zig");
+const LineMap = @import("LineMap.zig");
 
 const Parser = @This();
 
@@ -226,14 +227,17 @@ fn parseParagraph(self: *Parser) !Node {
         try text_lines.append(self.a, std.mem.trimLeft(u8, line, " \t"));
         self.pos += 1;
     }
-    const inlines = try inline_mod.parseInlines(self.a, text_lines.items);
+
+    const src = try inline_mod.joinLines(self.a, text_lines.items);
+    const inlines = if (src.len > 0) try inline_mod.parseInlineContent(self.a, src) else &.{};
 
     var para = Node{ .tag = .para, .children = inlines };
     if (self.track_pos) {
         const first_col = self.contentCol(para_start_line);
         para.start_pos = self.makePos(para_start_line, first_col);
         para.end_pos = self.makePos(self.pos, 0);
-        self.assignInlinePositions(inlines, text_lines.items, para_start_line);
+        const line_map = try self.buildInlineLineMap(text_lines.items, para_start_line);
+        applyInlinePositions(inlines, src, line_map);
     }
     return para;
 }
@@ -245,32 +249,39 @@ fn contentCol(self: *Parser, line_idx: usize) u32 {
     return @intCast(full_line.len - trimmed.len + 1);
 }
 
-fn assignInlinePositions(self: *Parser, nodes: []const Node, text_lines: []const []const u8, start_line: usize) void {
-    if (!self.track_pos) return;
-    const src = inline_mod.joinLines(self.a, text_lines) catch return;
+fn buildInlineLineMap(self: *Parser, text_lines: []const []const u8, start_line: usize) !LineMap {
+    var segs: std.ArrayList(LineMap.Segment) = .{};
+    var joined_pos: u32 = 0;
+    for (text_lines, 0..) |line, i| {
+        const orig_line_idx = start_line + i;
+        const col = self.contentCol(orig_line_idx);
+        const pos_val = self.makePos(orig_line_idx, col);
+        try segs.append(self.a, .{
+            .joined_start = joined_pos,
+            .orig_line = pos_val.line,
+            .orig_col = pos_val.col,
+            .orig_offset = pos_val.offset,
+        });
+        joined_pos += @intCast(line.len + 1);
+    }
+    return .{ .segments = try segs.toOwnedSlice(self.a) };
+}
 
-    var src_offset: usize = 0;
+/// Sets source positions on str nodes using pointer arithmetic against
+/// the joined source text. O(1) per node via LineMap, no string searching.
+fn applyInlinePositions(nodes: []const Node, src: []const u8, line_map: LineMap) void {
+    const src_start = @intFromPtr(src.ptr);
+    const src_end = src_start + src.len;
     for (nodes) |*node_const| {
         const node = @constCast(node_const);
         if (node.tag == .str and node.text.len > 0) {
-            const idx = std.mem.indexOf(u8, src[src_offset..], node.text) orelse continue;
-            const abs_idx = src_offset + idx;
-            var line_offset: usize = 0;
-            var mapped_ti: usize = 0;
-            for (text_lines, 0..) |tl, ti| {
-                if (abs_idx < line_offset + tl.len) {
-                    mapped_ti = ti;
-                    break;
-                }
-                line_offset += tl.len + 1;
+            const text_ptr = @intFromPtr(node.text.ptr);
+            if (text_ptr >= src_start and text_ptr < src_end) {
+                const offset: u32 = @intCast(text_ptr - src_start);
+                node.start_pos = line_map.resolve(offset);
+                const end_offset: u32 = offset + @as(u32, @intCast(node.text.len)) - 1;
+                node.end_pos = line_map.resolve(end_offset);
             }
-            const col_in_text = abs_idx - line_offset;
-            const orig_line = start_line + mapped_ti;
-            const col = self.contentCol(orig_line) + @as(u32, @intCast(col_in_text));
-
-            node.start_pos = self.makePos(orig_line, col);
-            node.end_pos = self.makePos(orig_line, col + @as(u32, @intCast(node.text.len)) - 1);
-            src_offset = abs_idx + node.text.len;
         }
     }
 }
@@ -467,6 +478,125 @@ fn tryFootnoteDef(self: *Parser) !?void {
     return {};
 }
 
+const ItemContent = struct {
+    para_lines: std.ArrayList([]const u8),
+    block_lines: std.ArrayList([]const u8),
+    item_saw_blank: bool,
+    para_orig_lines: std.ArrayList(usize),
+    para_col_offsets: std.ArrayList(u32),
+};
+
+fn collectItemContent(self: *Parser, content_col: usize, list_indent: usize, first_rest: []const u8) !ItemContent {
+    var content = ItemContent{
+        .para_lines = .{},
+        .block_lines = .{},
+        .item_saw_blank = false,
+        .para_orig_lines = .{},
+        .para_col_offsets = .{},
+    };
+
+    try content.para_lines.append(self.a, first_rest);
+    try content.para_orig_lines.append(self.a, self.pos);
+    try content.para_col_offsets.append(self.a, @intCast(content_col));
+    self.pos += 1;
+
+    while (self.pos < self.lines.len and !content.item_saw_blank) {
+        const next = self.lines[self.pos];
+        if (isBlank(next)) {
+            content.item_saw_blank = true;
+            self.pos += 1;
+            continue;
+        }
+        if (parseBulletMarker(next)) |m| {
+            if (m.indent <= list_indent) break;
+        }
+        if (parseOrderedMarker(next)) |m| {
+            if (m.indent <= list_indent) break;
+        }
+        const next_indent = countIndent(next);
+        const strip: u32 = if (next_indent >= content_col) @intCast(content_col) else @intCast(next_indent);
+        try content.para_lines.append(self.a, next[strip..]);
+        try content.para_orig_lines.append(self.a, self.pos);
+        try content.para_col_offsets.append(self.a, strip);
+        self.pos += 1;
+    }
+
+    var last_was_blank = true;
+    while (self.pos < self.lines.len and content.item_saw_blank) {
+        const next = self.lines[self.pos];
+        if (isBlank(next)) {
+            try content.block_lines.append(self.a, "");
+            self.pos += 1;
+            last_was_blank = true;
+            continue;
+        }
+        const next_indent = countIndent(next);
+        if (next_indent > list_indent) {
+            const is_marker = parseBulletMarker(next) != null or parseOrderedMarker(next) != null;
+            const strip = if (is_marker)
+                @min(next_indent, list_indent + 1)
+            else
+                @min(next_indent, content_col);
+            try content.block_lines.append(self.a, next[strip..]);
+            self.pos += 1;
+            last_was_blank = false;
+            continue;
+        }
+        if (!last_was_blank and !isNewBlockStart(next)) {
+            try content.block_lines.append(self.a, std.mem.trimLeft(u8, next, " \t"));
+            self.pos += 1;
+            last_was_blank = false;
+            continue;
+        }
+        break;
+    }
+
+    while (content.block_lines.items.len > 0 and isBlank(content.block_lines.items[content.block_lines.items.len - 1])) _ = content.block_lines.pop();
+
+    return content;
+}
+
+fn parseItemContent(self: *Parser, content: *const ItemContent) ![]const Node {
+    var inner_blocks: std.ArrayList(Node) = .{};
+
+    const para_text = try inline_mod.joinLines(self.a, content.para_lines.items);
+    if (para_text.len > 0) {
+        var para_parser = Parser.init(self.a, para_text, self.shared);
+        if (self.track_pos and content.para_orig_lines.items.len > 0) {
+            para_parser.track_pos = true;
+            const first_orig = content.para_orig_lines.items[0];
+            const first_col_off = content.para_col_offsets.items[0];
+            para_parser.base_line = self.base_line + @as(u32, @intCast(first_orig));
+            para_parser.base_offset = self.base_offset +
+                (if (first_orig < self.line_offsets.len) self.line_offsets[first_orig] else 0) +
+                first_col_off;
+            para_parser.col_offsets = content.para_col_offsets.items;
+        }
+        const blocks = try para_parser.parseBlocks();
+        for (blocks) |b| try inner_blocks.append(self.a, b);
+    }
+
+    if (content.block_lines.items.len > 0) {
+        const block_text = try inline_mod.joinLines(self.a, content.block_lines.items);
+        var block_parser = Parser.init(self.a, block_text, self.shared);
+        const blocks = try block_parser.parseBlocks();
+        for (blocks) |b| try inner_blocks.append(self.a, b);
+    }
+
+    return inner_blocks.toOwnedSlice(self.a);
+}
+
+fn updateListTightness(is_tight: *bool, saw_blank_between: *bool, content: *const ItemContent, inner_blocks: []const Node) void {
+    if (content.item_saw_blank and content.block_lines.items.len > 0) {
+        var para_count: usize = 0;
+        for (inner_blocks) |b| {
+            if (b.tag == .para) para_count += 1;
+        }
+        if (para_count > 1) is_tight.* = false;
+    }
+    if (content.item_saw_blank and content.block_lines.items.len == 0) saw_blank_between.* = true;
+}
+
 fn tryBulletList(self: *Parser) !?Node {
     const line = self.lines[self.pos];
     const first_info = parseBulletMarker(line) orelse return null;
@@ -487,112 +617,23 @@ fn tryBulletList(self: *Parser) !?Node {
         saw_blank_between = false;
 
         const item_start_line = self.pos;
-        const content_col = cur_li.content_col;
-        var para_lines: std.ArrayList([]const u8) = .{};
-        var para_orig_lines: std.ArrayList(usize) = .{};
-        var para_col_offsets: std.ArrayList(u32) = .{};
-        try para_lines.append(self.a, cur_li.rest);
-        try para_orig_lines.append(self.a, self.pos);
-        try para_col_offsets.append(self.a, @intCast(content_col));
-        self.pos += 1;
-
-        var block_lines: std.ArrayList([]const u8) = .{};
-        var item_saw_blank = false;
-
-        while (self.pos < self.lines.len and !item_saw_blank) {
-            const next = self.lines[self.pos];
-            if (isBlank(next)) {
-                item_saw_blank = true;
-                self.pos += 1;
-                continue;
-            }
-            if (parseBulletMarker(next)) |next_li| {
-                if (next_li.indent <= list_indent) break;
-            }
-            if (parseOrderedMarker(next)) |next_ol| {
-                if (next_ol.indent <= list_indent) break;
-            }
-            const next_indent = countIndent(next);
-            const strip: u32 = if (next_indent >= content_col) @intCast(content_col) else @intCast(next_indent);
-            try para_lines.append(self.a, next[strip..]);
-            try para_orig_lines.append(self.a, self.pos);
-            try para_col_offsets.append(self.a, strip);
-            self.pos += 1;
-        }
-
-        var last_was_blank = true;
-        while (self.pos < self.lines.len and item_saw_blank) {
-            const next = self.lines[self.pos];
-            if (isBlank(next)) {
-                try block_lines.append(self.a, "");
-                self.pos += 1;
-                last_was_blank = true;
-                continue;
-            }
-            const next_indent = countIndent(next);
-            if (next_indent > list_indent) {
-                const is_marker = parseBulletMarker(next) != null or parseOrderedMarker(next) != null;
-                const strip = if (is_marker)
-                    @min(next_indent, list_indent + 1)
-                else
-                    @min(next_indent, content_col);
-                try block_lines.append(self.a, next[strip..]);
-                self.pos += 1;
-                last_was_blank = false;
-                continue;
-            }
-            if (!last_was_blank and !isNewBlockStart(next)) {
-                try block_lines.append(self.a, std.mem.trimLeft(u8, next, " \t"));
-                self.pos += 1;
-                last_was_blank = false;
-                continue;
-            }
-            break;
-        }
-
-        while (block_lines.items.len > 0 and isBlank(block_lines.items[block_lines.items.len - 1])) _ = block_lines.pop();
-
-        var inner_blocks_list: std.ArrayList(Node) = .{};
+        var content = try self.collectItemContent(cur_li.content_col, list_indent, cur_li.rest);
 
         var is_task = false;
         var task_checked = false;
-        if (para_lines.items.len > 0) {
-            const first_line = para_lines.items[0];
+        if (content.para_lines.items.len > 0) {
+            const first_line = content.para_lines.items[0];
             if (std.mem.startsWith(u8, first_line, "[ ] ") or
                 std.mem.startsWith(u8, first_line, "[x] ") or
                 std.mem.startsWith(u8, first_line, "[X] "))
             {
                 is_task = true;
                 task_checked = first_line[1] != ' ';
-                para_lines.items[0] = first_line[4..];
+                content.para_lines.items[0] = first_line[4..];
             }
         }
 
-        const para_text = try inline_mod.joinLines(self.a, para_lines.items);
-        if (para_text.len > 0) {
-            var para_parser = Parser.init(self.a, para_text, self.shared);
-            if (self.track_pos and para_orig_lines.items.len > 0) {
-                para_parser.track_pos = true;
-                const first_orig = para_orig_lines.items[0];
-                const first_col_off = para_col_offsets.items[0];
-                para_parser.base_line = self.base_line + @as(u32, @intCast(first_orig));
-                para_parser.base_offset = self.base_offset +
-                    (if (first_orig < self.line_offsets.len) self.line_offsets[first_orig] else 0) +
-                    first_col_off;
-                para_parser.col_offsets = try para_col_offsets.toOwnedSlice(self.a);
-            }
-            const para_blocks = try para_parser.parseBlocks();
-            for (para_blocks) |b| try inner_blocks_list.append(self.a, b);
-        }
-
-        if (block_lines.items.len > 0) {
-            const block_text = try inline_mod.joinLines(self.a, block_lines.items);
-            var block_parser = Parser.init(self.a, block_text, self.shared);
-            const extra_blocks = try block_parser.parseBlocks();
-            for (extra_blocks) |b| try inner_blocks_list.append(self.a, b);
-        }
-
-        const inner_blocks = try inner_blocks_list.toOwnedSlice(self.a);
+        const inner_blocks = try self.parseItemContent(&content);
         const item_sp = if (self.track_pos) self.makePos(item_start_line, @intCast(list_indent + 1)) else null;
         const item_ep = if (self.track_pos) blk: {
             const ep_col: u32 = if (self.pos >= self.lines.len) 0 else 1;
@@ -605,14 +646,7 @@ fn tryBulletList(self: *Parser) !?Node {
             try items.append(self.a, .{ .tag = .list_item, .children = inner_blocks, .start_pos = item_sp, .end_pos = item_ep });
         }
 
-        if (item_saw_blank and block_lines.items.len > 0) {
-            var para_count: usize = 0;
-            for (inner_blocks) |b| {
-                if (b.tag == .para) para_count += 1;
-            }
-            if (para_count > 1) is_tight = false;
-        }
-        if (item_saw_blank and block_lines.items.len == 0) saw_blank_between = true;
+        updateListTightness(&is_tight, &saw_blank_between, &content, inner_blocks);
     }
 
     var has_task = false;
@@ -646,6 +680,7 @@ fn tryOrderedList(self: *Parser) !?Node {
     const line = self.lines[self.pos];
     const first_info = parseOrderedMarker(line) orelse return null;
     const list_indent = first_info.indent;
+    const list_start_line = self.pos;
 
     var possible_styles: [2]?ListStyle = first_info.styles;
     var n_possible: u2 = first_info.n_styles;
@@ -694,74 +729,18 @@ fn tryOrderedList(self: *Parser) !?Node {
         if (saw_blank_between and items.items.len > 0) is_tight = false;
         saw_blank_between = false;
 
-        const content_col = cur_ol.content_col;
-        var para_lines: std.ArrayList([]const u8) = .{};
-        try para_lines.append(self.a, cur_ol.rest);
-        self.pos += 1;
+        const item_start_line = self.pos;
+        const content = try self.collectItemContent(cur_ol.content_col, list_indent, cur_ol.rest);
+        const inner_blocks = try self.parseItemContent(&content);
 
-        var block_lines: std.ArrayList([]const u8) = .{};
-        var item_saw_blank = false;
+        const item_sp = if (self.track_pos) self.makePos(item_start_line, @intCast(list_indent + 1)) else null;
+        const item_ep = if (self.track_pos) blk: {
+            const ep_col: u32 = if (self.pos >= self.lines.len) 0 else 1;
+            break :blk self.makePos(self.pos, ep_col);
+        } else null;
+        try items.append(self.a, .{ .tag = .list_item, .children = inner_blocks, .start_pos = item_sp, .end_pos = item_ep });
 
-        while (self.pos < self.lines.len and !item_saw_blank) {
-            const next = self.lines[self.pos];
-            if (isBlank(next)) {
-                item_saw_blank = true;
-                saw_blank_between = true;
-                self.pos += 1;
-                continue;
-            }
-            if (parseOrderedMarker(next)) |next_ol| {
-                if (next_ol.indent == list_indent) break;
-            }
-            const next_indent = countIndent(next);
-            if (next_indent >= content_col) {
-                try para_lines.append(self.a, next[content_col..]);
-            } else {
-                try para_lines.append(self.a, next[next_indent..]);
-            }
-            self.pos += 1;
-        }
-
-        while (self.pos < self.lines.len and item_saw_blank) {
-            const next = self.lines[self.pos];
-            if (isBlank(next)) {
-                try block_lines.append(self.a, "");
-                self.pos += 1;
-                continue;
-            }
-            const next_indent = countIndent(next);
-            if (next_indent > list_indent) {
-                const is_marker = parseBulletMarker(next) != null or parseOrderedMarker(next) != null;
-                const strip = if (is_marker)
-                    @min(next_indent, list_indent + 1)
-                else
-                    @min(next_indent, content_col);
-                try block_lines.append(self.a, next[strip..]);
-                self.pos += 1;
-                continue;
-            }
-            break;
-        }
-
-        while (block_lines.items.len > 0 and isBlank(block_lines.items[block_lines.items.len - 1])) _ = block_lines.pop();
-
-        var inner_blocks_list: std.ArrayList(Node) = .{};
-
-        const para_text = try inline_mod.joinLines(self.a, para_lines.items);
-        if (para_text.len > 0) {
-            var para_parser = Parser.init(self.a, para_text, self.shared);
-            const para_blocks = try para_parser.parseBlocks();
-            for (para_blocks) |b| try inner_blocks_list.append(self.a, b);
-        }
-
-        if (block_lines.items.len > 0) {
-            const block_text = try inline_mod.joinLines(self.a, block_lines.items);
-            var block_parser = Parser.init(self.a, block_text, self.shared);
-            const extra_blocks = try block_parser.parseBlocks();
-            for (extra_blocks) |b| try inner_blocks_list.append(self.a, b);
-        }
-
-        try items.append(self.a, .{ .tag = .list_item, .children = try inner_blocks_list.toOwnedSlice(self.a) });
+        updateListTightness(&is_tight, &saw_blank_between, &content, inner_blocks);
     }
 
     const final_style = possible_styles[0] orelse .decimal;
@@ -775,11 +754,15 @@ fn tryOrderedList(self: *Parser) !?Node {
     if (final_style.htmlType()) |t| {
         try ol_attrs.append(self.a, .{ .key = "type", .value = t });
     }
+    const list_sp = if (self.track_pos) self.makePos(list_start_line, @intCast(list_indent + 1)) else null;
+    const list_ep = if (self.track_pos) self.makePos(self.pos, 0) else null;
     return .{
         .tag = .ordered_list,
         .children = try items.toOwnedSlice(self.a),
         .tight = is_tight,
         .attrs = try ol_attrs.toOwnedSlice(self.a),
+        .start_pos = list_sp,
+        .end_pos = list_ep,
     };
 }
 
@@ -1474,6 +1457,27 @@ fn romanToNumber(s: []const u8) usize {
     return if (total > 0) total else 1;
 }
 
+/// Advance past a backtick run and its matching closing run.
+/// Returns the index past the closing backticks, or past end of text if no close found.
+fn skipBacktickSpan(text: []const u8, start: usize) usize {
+    var run: usize = 0;
+    var j = start;
+    while (j < text.len and text[j] == '`') : (j += 1) run += 1;
+    var k = j;
+    while (k < text.len) {
+        if (text[k] == '`') {
+            var r2: usize = 0;
+            var m = k;
+            while (m < text.len and text[m] == '`') : (m += 1) r2 += 1;
+            if (r2 == run) return m;
+            k = m;
+        } else {
+            k += 1;
+        }
+    }
+    return text.len;
+}
+
 fn isTableRow(line: []const u8) bool {
     const trimmed = std.mem.trim(u8, line, " \t");
     if (trimmed.len < 1 or trimmed[0] != '|') return false;
@@ -1483,30 +1487,7 @@ fn isTableRow(line: []const u8) bool {
         if (trimmed[i] == '\\' and i + 1 < trimmed.len) {
             i += 2;
         } else if (trimmed[i] == '`') {
-            const ticks = inline_mod.parseInlineContent; // Need countRunAt
-            _ = ticks;
-            var run: usize = 0;
-            var j = i;
-            while (j < trimmed.len and trimmed[j] == '`') : (j += 1) run += 1;
-            const after = j;
-            var found_close = false;
-            var k = after;
-            while (k < trimmed.len) {
-                if (trimmed[k] == '`') {
-                    var r2: usize = 0;
-                    var m = k;
-                    while (m < trimmed.len and trimmed[m] == '`') : (m += 1) r2 += 1;
-                    if (r2 == run) {
-                        i = m;
-                        found_close = true;
-                        break;
-                    }
-                    k = m;
-                } else {
-                    k += 1;
-                }
-            }
-            if (!found_close) i = trimmed.len;
+            i = skipBacktickSpan(trimmed, i);
         } else {
             if (trimmed[i] == '|') pipes += 1;
             i += 1;
@@ -1560,28 +1541,7 @@ fn splitTableCells(a: Allocator, content: []const u8) ![]const []const u8 {
         if (content[i] == '\\' and i + 1 < content.len) {
             i += 2;
         } else if (content[i] == '`') {
-            var run: usize = 0;
-            var j = i;
-            while (j < content.len and content[j] == '`') : (j += 1) run += 1;
-            const after = j;
-            var found_close = false;
-            var k = after;
-            while (k < content.len) {
-                if (content[k] == '`') {
-                    var r2: usize = 0;
-                    var m = k;
-                    while (m < content.len and content[m] == '`') : (m += 1) r2 += 1;
-                    if (r2 == run) {
-                        i = m;
-                        found_close = true;
-                        break;
-                    }
-                    k = m;
-                } else {
-                    k += 1;
-                }
-            }
-            if (!found_close) i = content.len;
+            i = skipBacktickSpan(content, i);
         } else if (content[i] == '|') {
             try result.append(a, content[cell_start..i]);
             cell_start = i + 1;
