@@ -1,0 +1,121 @@
+//! Renders a djot AST as indented text. Format follows djot.js conventions.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Node = @import("node.zig").Node;
+
+pub fn renderAstNode(a: Allocator, out: *std.ArrayList(u8), node: Node, indent: usize, is_root: bool) !void {
+    var i: usize = 0;
+    while (i < indent) : (i += 1) try out.append(a, ' ');
+
+    const tag_name = if (is_root and node.tag == .section) "doc" else @tagName(node.tag);
+    try out.appendSlice(a, tag_name);
+
+    if (node.start_pos) |sp| {
+        if (node.end_pos) |ep| {
+            try out.appendSlice(a, try std.fmt.allocPrint(a,
+                " ({d}:{d}:{d}-{d}:{d}:{d})",
+                .{ sp.line, sp.col, sp.offset, ep.line, ep.col, ep.offset },
+            ));
+        }
+    }
+
+    switch (node.tag) {
+        .str, .verbatim, .raw_inline, .raw_block, .code_block, .footnote_reference, .symb => {
+            if (node.tag == .symb) {
+                if (node.text.len > 0) {
+                    try out.appendSlice(a, " alias=");
+                    try appendJsonStr(a, out, node.text);
+                }
+            } else if (node.text.len > 0) {
+                try out.appendSlice(a, " text=");
+                try appendJsonStr(a, out, node.text);
+            }
+        },
+        .heading => {
+            try out.appendSlice(a, try std.fmt.allocPrint(a, " level={d}", .{node.level}));
+        },
+        .bullet_list => {
+            try out.appendSlice(a, if (node.tight) " tight=true" else " tight=false");
+            if (node.style) |s| {
+                try out.appendSlice(a, " style=");
+                try appendJsonStr(a, out, s);
+            }
+        },
+        .ordered_list => {
+            try out.appendSlice(a, if (node.tight) " tight=true" else " tight=false");
+        },
+        .task_list_item => {
+            if (node.checked) |checked| {
+                try out.appendSlice(a, if (checked) " checked=true" else " checked=false");
+            }
+        },
+        .link, .image, .url, .email => {
+            if (node.destination) |dest| {
+                try out.appendSlice(a, " destination=");
+                try appendJsonStr(a, out, dest);
+            }
+            if (node.reference) |ref| {
+                if (ref.len > 0) {
+                    try out.appendSlice(a, " reference=");
+                    try appendJsonStr(a, out, ref);
+                }
+            }
+        },
+        .row => {
+            try out.appendSlice(a, if (node.head) " head=true" else " head=false");
+        },
+        .cell => {
+            try out.appendSlice(a, if (node.head) " head=true" else " head=false");
+            const align_str = switch (node.cell_align) {
+                .default => " align=\"default\"",
+                .left => " align=\"left\"",
+                .right => " align=\"right\"",
+                .center => " align=\"center\"",
+            };
+            try out.appendSlice(a, align_str);
+        },
+        else => {},
+    }
+
+    if (node.lang) |lang| {
+        try out.appendSlice(a, " lang=");
+        try appendJsonStr(a, out, lang);
+    }
+
+    if (node.id) |id| {
+        try out.appendSlice(a, " id=");
+        try appendJsonStr(a, out, id);
+    }
+    if (node.classes) |cls| {
+        try out.appendSlice(a, " class=");
+        try appendJsonStr(a, out, cls);
+    }
+    for (node.attrs) |attr| {
+        try out.append(a, ' ');
+        try out.appendSlice(a, attr.key);
+        try out.append(a, '=');
+        try appendJsonStr(a, out, attr.value);
+    }
+
+    try out.append(a, '\n');
+
+    for (node.children) |child| {
+        try renderAstNode(a, out, child, indent + 2, false);
+    }
+}
+
+fn appendJsonStr(a: Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(a, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(a, "\\\""),
+            '\\' => try out.appendSlice(a, "\\\\"),
+            '\n' => try out.appendSlice(a, "\\n"),
+            '\r' => try out.appendSlice(a, "\\r"),
+            '\t' => try out.appendSlice(a, "\\t"),
+            else => try out.append(a, c),
+        }
+    }
+    try out.append(a, '"');
+}
