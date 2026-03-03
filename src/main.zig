@@ -1,6 +1,9 @@
 const std = @import("std");
 const zjot = @import("zjot");
 
+var out_buf: [4096]u8 = undefined;
+var err_buf: [256]u8 = undefined;
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -22,8 +25,9 @@ pub fn main() !void {
             try printUsage();
             return;
         } else if (arg.len > 0 and arg[0] == '-') {
-            const stderr = std.fs.File.stderr().writer();
-            try stderr.print("zjot: unknown option: {s}\n", .{arg});
+            var w = std.fs.File.stderr().writer(&err_buf);
+            try w.interface.print("zjot: unknown option: {s}\n", .{arg});
+            try w.interface.flush();
             std.process.exit(1);
         } else {
             file_path = arg;
@@ -42,13 +46,14 @@ pub fn main() !void {
     };
     defer a.free(output);
 
-    const stdout = std.fs.File.stdout().writer();
-    try stdout.writeAll(output);
+    var w = std.fs.File.stdout().writer(&out_buf);
+    try w.interface.writeAll(output);
+    try w.interface.flush();
 }
 
 fn printUsage() !void {
-    const stdout = std.fs.File.stdout().writer();
-    try stdout.writeAll(
+    var w = std.fs.File.stdout().writer(&out_buf);
+    try w.interface.writeAll(
         \\Usage: zjot [OPTIONS] [FILE]
         \\
         \\Parse Djot markup and produce output.
@@ -61,4 +66,5 @@ fn printUsage() !void {
         \\  -h, --help    Show this help message
         \\
     );
+    try w.interface.flush();
 }
