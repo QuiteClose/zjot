@@ -1,0 +1,1595 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const node_mod = @import("node.zig");
+const Node = node_mod.Node;
+const Tag = node_mod.Tag;
+const Attr = node_mod.Attr;
+const SourcePos = node_mod.SourcePos;
+const CellAlign = node_mod.CellAlign;
+const attrs_mod = @import("attributes.zig");
+const BlockAttrs = attrs_mod.BlockAttrs;
+const inline_mod = @import("inline.zig");
+
+const Parser = @This();
+
+/// Shared mutable state across parser and all sub-parsers. Passed by pointer
+/// so mutations in sub-parsers (ref defs, footnotes, etc.) are automatically
+/// visible to the parent without copy-in/copy-out.
+pub const SharedState = struct {
+    ref_defs: std.StringArrayHashMapUnmanaged(RefDef) = .{},
+    auto_refs: std.StringArrayHashMapUnmanaged([]const u8) = .{},
+    ids_used: std.StringArrayHashMapUnmanaged(void) = .{},
+    footnote_defs: std.StringArrayHashMapUnmanaged([]const Node) = .{},
+    footnote_order: std.ArrayList([]const u8) = .{},
+};
+
+pub const RefDef = struct {
+    url: []const u8,
+    attrs: ?BlockAttrs = null,
+};
+
+a: Allocator,
+input: []const u8,
+lines: []const []const u8 = &.{},
+line_offsets: []const u32 = &.{},
+pos: usize = 0,
+shared: *SharedState,
+end_marker: ?[]const u8 = null,
+track_pos: bool = false,
+base_offset: u32 = 0,
+base_line: u32 = 1,
+col_offsets: []const u32 = &.{},
+
+pub fn init(a: Allocator, input: []const u8, shared: *SharedState) Parser {
+    var p = Parser{ .a = a, .input = input, .shared = shared };
+    // OOM here leaves lines empty; parseBlocks sees nothing and returns an empty doc.
+    p.splitLines() catch {};
+    return p;
+}
+
+fn splitLines(self: *Parser) !void {
+    var list: std.ArrayList([]const u8) = .{};
+    var offsets: std.ArrayList(u32) = .{};
+    var offset: u32 = 0;
+    var it = std.mem.splitScalar(u8, self.input, '\n');
+    while (it.next()) |line| {
+        try list.append(self.a, line);
+        try offsets.append(self.a, offset);
+        offset += @intCast(line.len + 1);
+    }
+    // A trailing newline produces an empty final element; discard it so
+    // line counts match the visible content.
+    if (list.items.len > 0 and list.items[list.items.len - 1].len == 0) {
+        _ = list.pop();
+        _ = offsets.pop();
+    }
+    self.lines = try list.toOwnedSlice(self.a);
+    self.line_offsets = try offsets.toOwnedSlice(self.a);
+}
+
+fn makePos(self: *Parser, line_idx: usize, col: u32) SourcePos {
+    const col_adj: u32 = if (line_idx < self.col_offsets.len) self.col_offsets[line_idx] else 0;
+    const display_col = col + col_adj;
+    // col is 1-based in djot sourcepos. col==0 means "end of previous line"
+    // (e.g. a closing fence), so the byte offset points one before this line.
+    const offset = if (line_idx < self.line_offsets.len) blk: {
+        if (col == 0) {
+            break :blk if (self.line_offsets[line_idx] > 0) self.line_offsets[line_idx] - 1 else 0;
+        }
+        break :blk self.line_offsets[line_idx] + col - 1;
+    } else if (self.line_offsets.len > 0)
+        self.line_offsets[self.line_offsets.len - 1] + @as(u32, @intCast(self.lines[self.lines.len - 1].len))
+    else
+        0;
+    return .{
+        .line = self.base_line + @as(u32, @intCast(line_idx)),
+        .col = display_col,
+        .offset = self.base_offset + offset,
+    };
+}
+
+pub fn parseDoc(self: *Parser) !Node {
+    const blocks = try self.parseBlocks();
+    const with_sections = try self.wrapSections(blocks);
+    const resolved = try self.resolveReferences(with_sections);
+
+    if (self.shared.footnote_order.items.len > 0) {
+        var all: std.ArrayList(Node) = .{};
+        for (resolved) |n| try all.append(self.a, n);
+        try all.append(self.a, try self.buildFootnoteSection());
+        return .{ .tag = .section, .children = try all.toOwnedSlice(self.a) };
+    }
+    return .{ .tag = .section, .children = resolved };
+}
+
+fn parseBlocks(self: *Parser) anyerror![]const Node {
+    return self.parseBlocksUntil(null);
+}
+
+fn parseBlocksUntil(self: *Parser, end_marker: ?[]const u8) anyerror![]const Node {
+    const prev_marker = self.end_marker;
+    self.end_marker = end_marker;
+    defer self.end_marker = prev_marker;
+    var children: std.ArrayList(Node) = .{};
+    var pending_attrs: ?BlockAttrs = null;
+
+    while (self.pos < self.lines.len) {
+        const line = self.lines[self.pos];
+
+        if (isBlank(line)) {
+            self.pos += 1;
+            pending_attrs = null;
+            continue;
+        }
+
+        if (end_marker) |marker| {
+            if (countLeadingChar(line, ':') >= marker.len and
+                isBlank(std.mem.trimLeft(u8, line, ":")))
+            {
+                self.pos += 1;
+                break;
+            }
+        }
+
+        if (try self.tryBlockAttr()) |ba| {
+            pending_attrs = mergeBlockAttrs(self.a, pending_attrs, ba) catch ba;
+            continue;
+        }
+
+        var node: Node = undefined;
+
+        if (try self.tryHeading()) |h| {
+            node = h;
+        } else if (self.tryThematicBreak()) |tb| {
+            node = tb;
+        } else if (try self.tryCodeBlock()) |cb| {
+            node = cb;
+        } else if (try self.tryBlockQuote()) |bq| {
+            node = bq;
+        } else if (try self.tryFencedDiv()) |fd| {
+            node = fd;
+        } else if (try self.tryRefDef(pending_attrs)) |_| {
+            pending_attrs = null;
+            continue;
+        } else if (try self.tryFootnoteDef()) |_| {
+            continue;
+        } else if (try self.tryDefinitionList()) |dl| {
+            node = dl;
+        } else if (try self.tryBulletList()) |bl| {
+            node = bl;
+        } else if (try self.tryOrderedList()) |ol| {
+            node = ol;
+        } else if (try self.tryTable()) |tbl| {
+            node = tbl;
+        } else {
+            node = try self.parseParagraph();
+        }
+
+        if (pending_attrs) |ba| {
+            node = inline_mod.applyBlockAttrsToNode(node, ba);
+            pending_attrs = null;
+        }
+
+        try children.append(self.a, node);
+    }
+
+    return children.toOwnedSlice(self.a);
+}
+
+fn tryBlockAttr(self: *Parser) !?BlockAttrs {
+    const line = self.lines[self.pos];
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len < 1 or trimmed[0] != '{') return null;
+
+    if (trimmed[trimmed.len - 1] == '}') {
+        if (attrs_mod.parseAttrsFromStr(self.a, trimmed)) |ba| {
+            self.pos += 1;
+            return ba;
+        }
+    }
+
+    const indent = indentOf(line);
+    var full_text: std.ArrayList(u8) = .{};
+    try full_text.appendSlice(self.a, trimmed);
+    var lines_consumed: usize = 1;
+
+    while (self.pos + lines_consumed < self.lines.len) {
+        const next = self.lines[self.pos + lines_consumed];
+        if (isBlank(next)) break;
+        const next_indent = indentOf(next);
+        if (next_indent <= indent) break;
+        try full_text.append(self.a, '\n');
+        try full_text.appendSlice(self.a, std.mem.trim(u8, next, " \t"));
+        lines_consumed += 1;
+
+        if (attrs_mod.parseAttrsFromStr(self.a, full_text.items)) |ba| {
+            self.pos += lines_consumed;
+            return ba;
+        }
+    }
+
+    return null;
+}
+
+fn isClosingFence(self: *const Parser, line: []const u8) bool {
+    const marker = self.end_marker orelse return false;
+    return countLeadingChar(line, ':') >= marker.len and isBlank(std.mem.trimLeft(u8, line, ":"));
+}
+
+fn parseParagraph(self: *Parser) !Node {
+    const para_start_line = self.pos;
+    var text_lines: std.ArrayList([]const u8) = .{};
+    while (self.pos < self.lines.len) {
+        const line = self.lines[self.pos];
+        if (isBlank(line)) break;
+        if (self.isClosingFence(line)) break;
+        try text_lines.append(self.a, std.mem.trimLeft(u8, line, " \t"));
+        self.pos += 1;
+    }
+    const inlines = try inline_mod.parseInlines(self.a, text_lines.items);
+
+    var para = Node{ .tag = .para, .children = inlines };
+    if (self.track_pos) {
+        const first_col = self.contentCol(para_start_line);
+        para.start_pos = self.makePos(para_start_line, first_col);
+        para.end_pos = self.makePos(self.pos, 0);
+        self.assignInlinePositions(inlines, text_lines.items, para_start_line);
+    }
+    return para;
+}
+
+fn contentCol(self: *Parser, line_idx: usize) u32 {
+    if (line_idx >= self.lines.len) return 1;
+    const full_line = self.lines[line_idx];
+    const trimmed = std.mem.trimLeft(u8, full_line, " \t");
+    return @intCast(full_line.len - trimmed.len + 1);
+}
+
+fn assignInlinePositions(self: *Parser, nodes: []const Node, text_lines: []const []const u8, start_line: usize) void {
+    if (!self.track_pos) return;
+    const src = inline_mod.joinLines(self.a, text_lines) catch return;
+
+    var src_offset: usize = 0;
+    for (nodes) |*node_const| {
+        const node = @constCast(node_const);
+        if (node.tag == .str and node.text.len > 0) {
+            const idx = std.mem.indexOf(u8, src[src_offset..], node.text) orelse continue;
+            const abs_idx = src_offset + idx;
+            var line_offset: usize = 0;
+            var mapped_ti: usize = 0;
+            for (text_lines, 0..) |tl, ti| {
+                if (abs_idx < line_offset + tl.len) {
+                    mapped_ti = ti;
+                    break;
+                }
+                line_offset += tl.len + 1;
+            }
+            const col_in_text = abs_idx - line_offset;
+            const orig_line = start_line + mapped_ti;
+            const col = self.contentCol(orig_line) + @as(u32, @intCast(col_in_text));
+
+            node.start_pos = self.makePos(orig_line, col);
+            node.end_pos = self.makePos(orig_line, col + @as(u32, @intCast(node.text.len)) - 1);
+            src_offset = abs_idx + node.text.len;
+        }
+    }
+}
+
+fn tryHeading(self: *Parser) !?Node {
+    const line = self.lines[self.pos];
+    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const hashes = countLeadingChar(trimmed, '#');
+    if (hashes == 0 or hashes > 6) return null;
+    if (hashes >= trimmed.len) {} else if (trimmed[hashes] != ' ' and trimmed[hashes] != '\t') return null;
+
+    self.pos += 1;
+    var content_lines: std.ArrayList([]const u8) = .{};
+    const after_hashes = std.mem.trim(u8, trimmed[hashes..], " \t");
+    if (after_hashes.len > 0) try content_lines.append(self.a, after_hashes);
+
+    while (self.pos < self.lines.len) {
+        const next = self.lines[self.pos];
+        if (isBlank(next)) break;
+        if (isThematicBreak(next) or isCodeFence(next) != null or
+            startsBlockQuote(next) or isFencedDivStart(next) != null)
+            break;
+        if (parseBulletMarker(next) != null or parseOrderedMarker(next) != null) break;
+        if (attrs_mod.tryParseBlockAttr(self.a, next) != null) break;
+        const next_trimmed = std.mem.trimLeft(u8, next, " ");
+        const next_hashes = countLeadingChar(next_trimmed, '#');
+        if (next_hashes == hashes and next_hashes < next_trimmed.len and
+            (next_trimmed[next_hashes] == ' ' or next_trimmed[next_hashes] == '\t'))
+        {
+            try content_lines.append(self.a, std.mem.trim(u8, next_trimmed[next_hashes..], " \t"));
+        } else if (next_hashes > 0 and next_hashes <= 6 and next_hashes != hashes and
+            (next_hashes >= next_trimmed.len or next_trimmed[next_hashes] == ' ' or next_trimmed[next_hashes] == '\t'))
+        {
+            break;
+        } else {
+            try content_lines.append(self.a, next);
+        }
+        self.pos += 1;
+    }
+
+    const inlines = try inline_mod.parseInlines(self.a, content_lines.items);
+    return .{ .tag = .heading, .level = @intCast(hashes), .children = inlines };
+}
+
+fn tryThematicBreak(self: *Parser) ?Node {
+    const line = self.lines[self.pos];
+    if (!isThematicBreak(line)) return null;
+    self.pos += 1;
+    return .{ .tag = .thematic_break };
+}
+
+fn tryCodeBlock(self: *Parser) !?Node {
+    const line = self.lines[self.pos];
+    const fence_info = isCodeFence(line) orelse return null;
+    self.pos += 1;
+
+    var content: std.ArrayList(u8) = .{};
+    while (self.pos < self.lines.len) {
+        const l = self.lines[self.pos];
+        self.pos += 1;
+        const close_char = countLeadingChar(std.mem.trimLeft(u8, l, " "), fence_info.char);
+        if (close_char >= fence_info.len and
+            isBlank(std.mem.trimLeft(u8, std.mem.trimLeft(u8, l, " ")[close_char..], &[_]u8{fence_info.char})))
+        {
+            break;
+        }
+        var stripped = l;
+        var indent_remaining = fence_info.indent;
+        while (indent_remaining > 0 and stripped.len > 0 and stripped[0] == ' ') {
+            stripped = stripped[1..];
+            indent_remaining -= 1;
+        }
+        try content.appendSlice(self.a, stripped);
+        try content.append(self.a, '\n');
+    }
+
+    const lang = fence_info.lang;
+    if (lang != null and lang.?[0] == '=') {
+        return .{ .tag = .raw_block, .text = try content.toOwnedSlice(self.a), .lang = lang.?[1..] };
+    }
+    return .{ .tag = .code_block, .text = try content.toOwnedSlice(self.a), .lang = lang };
+}
+
+fn tryBlockQuote(self: *Parser) !?Node {
+    const line = self.lines[self.pos];
+    if (!startsBlockQuote(line)) return null;
+
+    var inner_lines: std.ArrayList([]const u8) = .{};
+    while (self.pos < self.lines.len) {
+        const l = self.lines[self.pos];
+        if (startsBlockQuote(l)) {
+            try inner_lines.append(self.a, stripBlockQuotePrefix(l));
+            self.pos += 1;
+        } else if (!isBlank(l) and inner_lines.items.len > 0 and
+            !isBlank(inner_lines.items[inner_lines.items.len - 1]) and
+            !self.isClosingFence(l))
+        {
+            try inner_lines.append(self.a, l);
+            self.pos += 1;
+        } else {
+            break;
+        }
+    }
+
+    const inner_text = try inline_mod.joinLines(self.a, inner_lines.items);
+    var inner_parser = Parser.init(self.a, inner_text, self.shared);
+    const inner_blocks = try inner_parser.parseBlocks();
+    const tagged = try self.addHeadingIds(inner_blocks);
+    return .{ .tag = .block_quote, .children = tagged };
+}
+
+fn tryFencedDiv(self: *Parser) !?Node {
+    const line = self.lines[self.pos];
+    const div_info = isFencedDivStart(line) orelse return null;
+    self.pos += 1;
+    const blocks = try self.parseBlocksUntil(div_info.fence);
+    var node = Node{ .tag = .div, .children = blocks };
+    if (div_info.class) |cls| node.classes = cls;
+    return node;
+}
+
+fn tryRefDef(self: *Parser, pending_attrs: ?BlockAttrs) !?void {
+    const line = self.lines[self.pos];
+    const trimmed = std.mem.trimLeft(u8, line, " ");
+    if (trimmed.len < 4 or trimmed[0] != '[') return null;
+    const close_bracket = std.mem.indexOfScalar(u8, trimmed[1..], ']') orelse return null;
+    if (close_bracket + 2 >= trimmed.len or trimmed[close_bracket + 2] != ':') return null;
+    const label = trimmed[1 .. close_bracket + 1];
+    var dest_text = std.mem.trim(u8, trimmed[close_bracket + 3 ..], " \t");
+    if (label.len > 0 and label[0] == '^') return null;
+
+    self.pos += 1;
+    var dest_parts: std.ArrayList([]const u8) = .{};
+    if (dest_text.len > 0) try dest_parts.append(self.a, dest_text);
+    while (self.pos < self.lines.len) {
+        const next = self.lines[self.pos];
+        if (isBlank(next)) break;
+        if (next.len == 0 or (next[0] != ' ' and next[0] != '\t')) break;
+        const next_trimmed = std.mem.trimLeft(u8, next, " ");
+        if (next_trimmed.len > 0 and next_trimmed[0] == '[') break;
+        try dest_parts.append(self.a, std.mem.trim(u8, next, " \t"));
+        self.pos += 1;
+    }
+
+    if (dest_parts.items.len == 0) {
+        dest_text = "";
+    } else if (dest_parts.items.len == 1) {
+        dest_text = dest_parts.items[0];
+    } else {
+        var buf: std.ArrayList(u8) = .{};
+        for (dest_parts.items) |part| try buf.appendSlice(self.a, part);
+        dest_text = try buf.toOwnedSlice(self.a);
+    }
+
+    try self.shared.ref_defs.put(self.a, label, .{ .url = dest_text, .attrs = pending_attrs });
+    return {};
+}
+
+fn tryFootnoteDef(self: *Parser) !?void {
+    const line = self.lines[self.pos];
+    const trimmed = std.mem.trimLeft(u8, line, " ");
+    if (trimmed.len < 5 or !std.mem.startsWith(u8, trimmed, "[^")) return null;
+    const close = std.mem.indexOfScalar(u8, trimmed[2..], ']') orelse return null;
+    if (close + 3 >= trimmed.len or trimmed[close + 3] != ':') return null;
+
+    const label = trimmed[2 .. close + 2];
+    const rest = std.mem.trim(u8, trimmed[close + 4 ..], " \t");
+    self.pos += 1;
+
+    var content_lines: std.ArrayList([]const u8) = .{};
+    if (rest.len > 0) try content_lines.append(self.a, rest);
+    while (self.pos < self.lines.len) {
+        const l = self.lines[self.pos];
+        if (isBlank(l)) {
+            var lookahead = self.pos + 1;
+            while (lookahead < self.lines.len and isBlank(self.lines[lookahead])) : (lookahead += 1) {}
+            if (lookahead < self.lines.len and
+                self.lines[lookahead].len > 0 and
+                (self.lines[lookahead][0] == ' ' or self.lines[lookahead][0] == '\t'))
+            {
+                try content_lines.append(self.a, "");
+                self.pos += 1;
+            } else break;
+        } else if (l.len > 0 and (l[0] == ' ' or l[0] == '\t')) {
+            try content_lines.append(self.a, std.mem.trimLeft(u8, l, " \t"));
+            self.pos += 1;
+        } else break;
+    }
+
+    const inner_text = try inline_mod.joinLines(self.a, content_lines.items);
+    var inner_parser = Parser.init(self.a, inner_text, self.shared);
+    const inner_blocks = try inner_parser.parseBlocks();
+    try self.shared.footnote_defs.put(self.a, label, inner_blocks);
+    return {};
+}
+
+fn tryBulletList(self: *Parser) !?Node {
+    const line = self.lines[self.pos];
+    const first_info = parseBulletMarker(line) orelse return null;
+    const list_indent = first_info.indent;
+    const marker_char = first_info.marker;
+    const list_start_line = self.pos;
+
+    var items: std.ArrayList(Node) = .{};
+    var is_tight = true;
+    var saw_blank_between = false;
+
+    while (self.pos < self.lines.len) {
+        const cur = self.lines[self.pos];
+        const cur_li = parseBulletMarker(cur) orelse break;
+        if (cur_li.indent != list_indent or cur_li.marker != marker_char) break;
+
+        if (saw_blank_between) is_tight = false;
+        saw_blank_between = false;
+
+        const item_start_line = self.pos;
+        const content_col = cur_li.content_col;
+        var para_lines: std.ArrayList([]const u8) = .{};
+        var para_orig_lines: std.ArrayList(usize) = .{};
+        var para_col_offsets: std.ArrayList(u32) = .{};
+        try para_lines.append(self.a, cur_li.rest);
+        try para_orig_lines.append(self.a, self.pos);
+        try para_col_offsets.append(self.a, @intCast(content_col));
+        self.pos += 1;
+
+        var block_lines: std.ArrayList([]const u8) = .{};
+        var item_saw_blank = false;
+
+        while (self.pos < self.lines.len and !item_saw_blank) {
+            const next = self.lines[self.pos];
+            if (isBlank(next)) {
+                item_saw_blank = true;
+                self.pos += 1;
+                continue;
+            }
+            if (parseBulletMarker(next)) |next_li| {
+                if (next_li.indent <= list_indent) break;
+            }
+            if (parseOrderedMarker(next)) |next_ol| {
+                if (next_ol.indent <= list_indent) break;
+            }
+            const next_indent = countIndent(next);
+            const strip: u32 = if (next_indent >= content_col) @intCast(content_col) else @intCast(next_indent);
+            try para_lines.append(self.a, next[strip..]);
+            try para_orig_lines.append(self.a, self.pos);
+            try para_col_offsets.append(self.a, strip);
+            self.pos += 1;
+        }
+
+        var last_was_blank = true;
+        while (self.pos < self.lines.len and item_saw_blank) {
+            const next = self.lines[self.pos];
+            if (isBlank(next)) {
+                try block_lines.append(self.a, "");
+                self.pos += 1;
+                last_was_blank = true;
+                continue;
+            }
+            const next_indent = countIndent(next);
+            if (next_indent > list_indent) {
+                const is_marker = parseBulletMarker(next) != null or parseOrderedMarker(next) != null;
+                const strip = if (is_marker)
+                    @min(next_indent, list_indent + 1)
+                else
+                    @min(next_indent, content_col);
+                try block_lines.append(self.a, next[strip..]);
+                self.pos += 1;
+                last_was_blank = false;
+                continue;
+            }
+            if (!last_was_blank and !isNewBlockStart(next)) {
+                try block_lines.append(self.a, std.mem.trimLeft(u8, next, " \t"));
+                self.pos += 1;
+                last_was_blank = false;
+                continue;
+            }
+            break;
+        }
+
+        while (block_lines.items.len > 0 and isBlank(block_lines.items[block_lines.items.len - 1])) _ = block_lines.pop();
+
+        var inner_blocks_list: std.ArrayList(Node) = .{};
+
+        var is_task = false;
+        var task_checked = false;
+        if (para_lines.items.len > 0) {
+            const first_line = para_lines.items[0];
+            if (std.mem.startsWith(u8, first_line, "[ ] ") or
+                std.mem.startsWith(u8, first_line, "[x] ") or
+                std.mem.startsWith(u8, first_line, "[X] "))
+            {
+                is_task = true;
+                task_checked = first_line[1] != ' ';
+                para_lines.items[0] = first_line[4..];
+            }
+        }
+
+        const para_text = try inline_mod.joinLines(self.a, para_lines.items);
+        if (para_text.len > 0) {
+            var para_parser = Parser.init(self.a, para_text, self.shared);
+            if (self.track_pos and para_orig_lines.items.len > 0) {
+                para_parser.track_pos = true;
+                const first_orig = para_orig_lines.items[0];
+                const first_col_off = para_col_offsets.items[0];
+                para_parser.base_line = self.base_line + @as(u32, @intCast(first_orig));
+                para_parser.base_offset = self.base_offset +
+                    (if (first_orig < self.line_offsets.len) self.line_offsets[first_orig] else 0) +
+                    first_col_off;
+                para_parser.col_offsets = try para_col_offsets.toOwnedSlice(self.a);
+            }
+            const para_blocks = try para_parser.parseBlocks();
+            for (para_blocks) |b| try inner_blocks_list.append(self.a, b);
+        }
+
+        if (block_lines.items.len > 0) {
+            const block_text = try inline_mod.joinLines(self.a, block_lines.items);
+            var block_parser = Parser.init(self.a, block_text, self.shared);
+            const extra_blocks = try block_parser.parseBlocks();
+            for (extra_blocks) |b| try inner_blocks_list.append(self.a, b);
+        }
+
+        const inner_blocks = try inner_blocks_list.toOwnedSlice(self.a);
+        const item_sp = if (self.track_pos) self.makePos(item_start_line, @intCast(list_indent + 1)) else null;
+        const item_ep = if (self.track_pos) blk: {
+            const ep_col: u32 = if (self.pos >= self.lines.len) 0 else 1;
+            break :blk self.makePos(self.pos, ep_col);
+        } else null;
+
+        if (is_task) {
+            try items.append(self.a, .{ .tag = .task_list_item, .children = inner_blocks, .checked = task_checked, .start_pos = item_sp, .end_pos = item_ep });
+        } else {
+            try items.append(self.a, .{ .tag = .list_item, .children = inner_blocks, .start_pos = item_sp, .end_pos = item_ep });
+        }
+
+        if (item_saw_blank and block_lines.items.len > 0) {
+            var para_count: usize = 0;
+            for (inner_blocks) |b| {
+                if (b.tag == .para) para_count += 1;
+            }
+            if (para_count > 1) is_tight = false;
+        }
+        if (item_saw_blank and block_lines.items.len == 0) saw_blank_between = true;
+    }
+
+    var has_task = false;
+    for (items.items) |item| {
+        if (item.tag == .task_list_item) {
+            has_task = true;
+            break;
+        }
+    }
+
+    const list_tag: Tag = if (has_task) .task_list else .bullet_list;
+    const list_sp = if (self.track_pos) self.makePos(list_start_line, @intCast(list_indent + 1)) else null;
+    const list_ep = if (self.track_pos) self.makePos(self.pos, 0) else null;
+    const marker_str: []const u8 = switch (marker_char) {
+        '-' => "-",
+        '+' => "+",
+        '*' => "*",
+        else => "-",
+    };
+    return .{
+        .tag = list_tag,
+        .children = try items.toOwnedSlice(self.a),
+        .tight = is_tight,
+        .style = marker_str,
+        .start_pos = list_sp,
+        .end_pos = list_ep,
+    };
+}
+
+fn tryOrderedList(self: *Parser) !?Node {
+    const line = self.lines[self.pos];
+    const first_info = parseOrderedMarker(line) orelse return null;
+    const list_indent = first_info.indent;
+
+    var possible_styles: [2]?ListStyle = first_info.styles;
+    var n_possible: u2 = first_info.n_styles;
+
+    var items: std.ArrayList(Node) = .{};
+    var is_tight = true;
+    var saw_blank_between = false;
+
+    while (self.pos < self.lines.len) {
+        const cur = self.lines[self.pos];
+        const cur_ol = parseOrderedMarker(cur) orelse break;
+        if (cur_ol.indent != list_indent) break;
+
+        var compatible = false;
+        for (0..cur_ol.n_styles) |si| {
+            const s = cur_ol.styles[si] orelse continue;
+            for (0..n_possible) |pi| {
+                if (possible_styles[pi] == s) {
+                    compatible = true;
+                    break;
+                }
+            }
+            if (compatible) break;
+        }
+        if (!compatible and items.items.len > 0) break;
+
+        if (items.items.len > 0) {
+            var new_styles: [2]?ListStyle = .{ null, null };
+            var new_n: u2 = 0;
+            for (0..n_possible) |pi| {
+                const ps = possible_styles[pi] orelse continue;
+                for (0..cur_ol.n_styles) |si| {
+                    if (cur_ol.styles[si] == ps) {
+                        new_styles[new_n] = ps;
+                        new_n += 1;
+                        break;
+                    }
+                }
+            }
+            if (new_n > 0) {
+                possible_styles = new_styles;
+                n_possible = new_n;
+            }
+        }
+
+        if (saw_blank_between and items.items.len > 0) is_tight = false;
+        saw_blank_between = false;
+
+        const content_col = cur_ol.content_col;
+        var para_lines: std.ArrayList([]const u8) = .{};
+        try para_lines.append(self.a, cur_ol.rest);
+        self.pos += 1;
+
+        var block_lines: std.ArrayList([]const u8) = .{};
+        var item_saw_blank = false;
+
+        while (self.pos < self.lines.len and !item_saw_blank) {
+            const next = self.lines[self.pos];
+            if (isBlank(next)) {
+                item_saw_blank = true;
+                saw_blank_between = true;
+                self.pos += 1;
+                continue;
+            }
+            if (parseOrderedMarker(next)) |next_ol| {
+                if (next_ol.indent == list_indent) break;
+            }
+            const next_indent = countIndent(next);
+            if (next_indent >= content_col) {
+                try para_lines.append(self.a, next[content_col..]);
+            } else {
+                try para_lines.append(self.a, next[next_indent..]);
+            }
+            self.pos += 1;
+        }
+
+        while (self.pos < self.lines.len and item_saw_blank) {
+            const next = self.lines[self.pos];
+            if (isBlank(next)) {
+                try block_lines.append(self.a, "");
+                self.pos += 1;
+                continue;
+            }
+            const next_indent = countIndent(next);
+            if (next_indent > list_indent) {
+                const is_marker = parseBulletMarker(next) != null or parseOrderedMarker(next) != null;
+                const strip = if (is_marker)
+                    @min(next_indent, list_indent + 1)
+                else
+                    @min(next_indent, content_col);
+                try block_lines.append(self.a, next[strip..]);
+                self.pos += 1;
+                continue;
+            }
+            break;
+        }
+
+        while (block_lines.items.len > 0 and isBlank(block_lines.items[block_lines.items.len - 1])) _ = block_lines.pop();
+
+        var inner_blocks_list: std.ArrayList(Node) = .{};
+
+        const para_text = try inline_mod.joinLines(self.a, para_lines.items);
+        if (para_text.len > 0) {
+            var para_parser = Parser.init(self.a, para_text, self.shared);
+            const para_blocks = try para_parser.parseBlocks();
+            for (para_blocks) |b| try inner_blocks_list.append(self.a, b);
+        }
+
+        if (block_lines.items.len > 0) {
+            const block_text = try inline_mod.joinLines(self.a, block_lines.items);
+            var block_parser = Parser.init(self.a, block_text, self.shared);
+            const extra_blocks = try block_parser.parseBlocks();
+            for (extra_blocks) |b| try inner_blocks_list.append(self.a, b);
+        }
+
+        try items.append(self.a, .{ .tag = .list_item, .children = try inner_blocks_list.toOwnedSlice(self.a) });
+    }
+
+    const final_style = possible_styles[0] orelse .decimal;
+    const resolved_start = getListStart(first_info.marker_text, final_style);
+    var ol_attrs: std.ArrayList(Attr) = .{};
+    if (resolved_start != 1) {
+        var start_buf: [20]u8 = undefined;
+        const start_str = std.fmt.bufPrint(&start_buf, "{}", .{resolved_start}) catch "1";
+        try ol_attrs.append(self.a, .{ .key = "start", .value = try self.a.dupe(u8, start_str) });
+    }
+    if (final_style.htmlType()) |t| {
+        try ol_attrs.append(self.a, .{ .key = "type", .value = t });
+    }
+    return .{
+        .tag = .ordered_list,
+        .children = try items.toOwnedSlice(self.a),
+        .tight = is_tight,
+        .attrs = try ol_attrs.toOwnedSlice(self.a),
+    };
+}
+
+fn tryDefinitionList(self: *Parser) !?Node {
+    const line = self.lines[self.pos];
+    const trimmed = std.mem.trimLeft(u8, line, " ");
+    if (trimmed.len < 2 or trimmed[0] != ':' or (trimmed[1] != ' ' and trimmed[1] != '\t')) return null;
+
+    var items: std.ArrayList(Node) = .{};
+
+    while (self.pos < self.lines.len) {
+        const cur = self.lines[self.pos];
+        const cur_trimmed = std.mem.trimLeft(u8, cur, " ");
+        if (cur_trimmed.len < 2 or cur_trimmed[0] != ':' or (cur_trimmed[1] != ' ' and cur_trimmed[1] != '\t')) break;
+
+        const marker_indent = @as(usize, @intCast(cur.len - cur_trimmed.len));
+        const content_indent = marker_indent + 2;
+        const first_content = cur_trimmed[2..];
+        self.pos += 1;
+
+        var content_lines: std.ArrayList([]const u8) = .{};
+        try content_lines.append(self.a, first_content);
+
+        while (self.pos < self.lines.len) {
+            const next = self.lines[self.pos];
+            if (isBlank(next)) {
+                self.pos += 1;
+                var blanks: usize = 1;
+                while (self.pos < self.lines.len and isBlank(self.lines[self.pos])) {
+                    self.pos += 1;
+                    blanks += 1;
+                }
+                if (self.pos >= self.lines.len) break;
+                const peek = self.lines[self.pos];
+                if (countIndent(peek) >= content_indent) {
+                    var b: usize = 0;
+                    while (b < blanks) : (b += 1) try content_lines.append(self.a, "");
+                    continue;
+                }
+                break;
+            }
+            const ni = countIndent(next);
+            if (ni >= content_indent) {
+                try content_lines.append(self.a, next[content_indent..]);
+                self.pos += 1;
+            } else if (ni > marker_indent and ni < content_indent) {
+                try content_lines.append(self.a, std.mem.trimLeft(u8, next, " \t"));
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+
+        const content_text = try inline_mod.joinLines(self.a, content_lines.items);
+        var inner_parser = Parser.init(self.a, content_text, self.shared);
+        const all_blocks = try inner_parser.parseBlocks();
+
+        var term_node: Node = undefined;
+        var def_blocks: []const Node = &.{};
+        if (all_blocks.len > 0 and all_blocks[0].tag == .para) {
+            term_node = .{ .tag = .term, .children = all_blocks[0].children };
+            def_blocks = all_blocks[1..];
+        } else {
+            term_node = .{ .tag = .term, .children = &.{} };
+            def_blocks = all_blocks;
+        }
+
+        var item_children: std.ArrayList(Node) = .{};
+        try item_children.append(self.a, term_node);
+        try item_children.append(self.a, .{ .tag = .definition, .children = def_blocks });
+        try items.append(self.a, .{ .tag = .definition_list_item, .children = try item_children.toOwnedSlice(self.a) });
+    }
+
+    if (items.items.len == 0) return null;
+    return .{ .tag = .definition_list, .children = try items.toOwnedSlice(self.a) };
+}
+
+fn tryTable(self: *Parser) !?Node {
+    const line = self.lines[self.pos];
+    if (!isTableRow(line)) return null;
+
+    var raw_rows: std.ArrayList([]const u8) = .{};
+    while (self.pos < self.lines.len) {
+        const l = self.lines[self.pos];
+        if (!isTableRow(l)) break;
+        try raw_rows.append(self.a, l);
+        self.pos += 1;
+    }
+
+    var aligns: std.ArrayList([]const CellAlign) = .{};
+    var head_above: std.ArrayList(bool) = .{};
+    for (raw_rows.items) |r| {
+        if (isTableSep(r)) {
+            try aligns.append(self.a, try parseSepAligns(self.a, r));
+            try head_above.append(self.a, true);
+        } else {
+            try aligns.append(self.a, &.{});
+            try head_above.append(self.a, false);
+        }
+    }
+
+    var is_head_row: std.ArrayList(bool) = .{};
+    for (raw_rows.items, 0..) |_, idx| {
+        if (head_above.items[idx]) {
+            try is_head_row.append(self.a, false);
+        } else {
+            const next_is_sep = (idx + 1 < head_above.items.len and head_above.items[idx + 1]);
+            try is_head_row.append(self.a, next_is_sep);
+        }
+    }
+
+    var rows: std.ArrayList(Node) = .{};
+    var current_aligns: []const CellAlign = &.{};
+    for (raw_rows.items, 0..) |r, idx| {
+        if (head_above.items[idx]) {
+            current_aligns = aligns.items[idx];
+            continue;
+        }
+        const effective_aligns = if (is_head_row.items[idx])
+            (if (idx + 1 < aligns.items.len) aligns.items[idx + 1] else current_aligns)
+        else
+            current_aligns;
+        const cells = try self.parseTableRowWithAlign(r, effective_aligns, is_head_row.items[idx]);
+        try rows.append(self.a, .{ .tag = .row, .children = cells });
+    }
+
+    var cap_lines: std.ArrayList([]const u8) = .{};
+    while (self.pos < self.lines.len) {
+        var look = self.pos;
+        while (look < self.lines.len and isBlank(self.lines[look])) : (look += 1) {}
+        if (look >= self.lines.len) break;
+        const t = std.mem.trimLeft(u8, self.lines[look], " \t");
+        if (t.len > 1 and t[0] == '^' and t[1] == ' ') {
+            cap_lines.items.len = 0;
+            self.pos = look;
+            try cap_lines.append(self.a, std.mem.trim(u8, t[2..], " \t"));
+            self.pos += 1;
+            while (self.pos < self.lines.len) {
+                const l = self.lines[self.pos];
+                if (isBlank(l)) break;
+                if (isTableRow(l)) break;
+                try cap_lines.append(self.a, std.mem.trim(u8, l, " \t"));
+                self.pos += 1;
+            }
+        } else break;
+    }
+
+    var table_children: std.ArrayList(Node) = .{};
+    if (cap_lines.items.len > 0) {
+        const cap_inlines = try inline_mod.parseInlines(self.a, cap_lines.items);
+        try table_children.append(self.a, .{ .tag = .caption, .children = cap_inlines });
+    }
+    for (rows.items) |r| try table_children.append(self.a, r);
+
+    return .{ .tag = .table, .children = try table_children.toOwnedSlice(self.a) };
+}
+
+fn parseTableRowWithAlign(self: *Parser, line: []const u8, col_aligns: []const CellAlign, is_head: bool) ![]const Node {
+    var cells: std.ArrayList(Node) = .{};
+    const trimmed = std.mem.trim(u8, line, " \t");
+    var content = trimmed;
+    if (content.len > 0 and content[0] == '|') content = content[1..];
+    if (content.len > 0 and content[content.len - 1] == '|') content = content[0 .. content.len - 1];
+
+    const cell_strs = try splitTableCells(self.a, content);
+    for (cell_strs, 0..) |cell, col| {
+        const cell_text = std.mem.trim(u8, cell, " \t");
+        const inlines = try inline_mod.parseInlines(self.a, &.{cell_text});
+        var node = Node{ .tag = .cell, .children = inlines, .head = is_head };
+        if (col < col_aligns.len) node.cell_align = col_aligns[col];
+        try cells.append(self.a, node);
+    }
+    return cells.toOwnedSlice(self.a);
+}
+
+// --- Section wrapping, ID generation, reference resolution ---
+
+fn registerExplicitIds(self: *Parser, blocks: []const Node) !void {
+    for (blocks) |block| {
+        if (block.id) |id| try self.shared.ids_used.put(self.a, id, {});
+        if (block.children.len > 0) try self.registerExplicitIds(block.children);
+    }
+}
+
+fn wrapSections(self: *Parser, blocks: []const Node) ![]const Node {
+    try self.registerExplicitIds(blocks);
+
+    var result: std.ArrayList(Node) = .{};
+    var section_stack: std.ArrayList(SectionInfo) = .{};
+    defer section_stack.deinit(self.a);
+
+    for (blocks) |block| {
+        if (block.tag == .heading) {
+            const level = block.level;
+            while (section_stack.items.len > 0) {
+                const top = &section_stack.items[section_stack.items.len - 1];
+                if (top.level >= level) {
+                    const sec = try self.closeSection(top);
+                    _ = section_stack.pop();
+                    if (section_stack.items.len > 0) {
+                        try section_stack.items[section_stack.items.len - 1].children.append(self.a, sec);
+                    } else {
+                        try result.append(self.a, sec);
+                    }
+                } else break;
+            }
+
+            const heading_text = getNodeText(block);
+            const heading_id = block.id orelse try self.generateId(heading_text);
+            const dest = try std.fmt.allocPrint(self.a, "#{s}", .{heading_id});
+            try self.shared.auto_refs.put(self.a, heading_text, dest);
+
+            // ID and attributes move from the heading to its wrapping section,
+            // so the section carries the anchor and the heading renders clean.
+            var sec_info = SectionInfo{ .level = level, .id = heading_id, .attrs = block.attrs, .classes = block.classes };
+            var heading_node = block;
+            heading_node.id = null;
+            heading_node.attrs = &.{};
+            heading_node.classes = null;
+            try sec_info.children.append(self.a, heading_node);
+            try section_stack.append(self.a, sec_info);
+        } else {
+            if (section_stack.items.len > 0) {
+                try section_stack.items[section_stack.items.len - 1].children.append(self.a, block);
+            } else {
+                try result.append(self.a, block);
+            }
+        }
+    }
+
+    while (section_stack.items.len > 0) {
+        const top = &section_stack.items[section_stack.items.len - 1];
+        const sec = try self.closeSection(top);
+        _ = section_stack.pop();
+        if (section_stack.items.len > 0) {
+            try section_stack.items[section_stack.items.len - 1].children.append(self.a, sec);
+        } else {
+            try result.append(self.a, sec);
+        }
+    }
+
+    return result.toOwnedSlice(self.a);
+}
+
+const SectionInfo = struct {
+    level: u8 = 0,
+    id: []const u8 = "",
+    children: std.ArrayList(Node) = .{},
+    attrs: []const Attr = &.{},
+    classes: ?[]const u8 = null,
+};
+
+fn addHeadingIds(self: *Parser, blocks: []const Node) ![]const Node {
+    var result: std.ArrayList(Node) = .{};
+    for (blocks) |block| {
+        if (block.tag == .heading and block.id == null) {
+            var h = block;
+            const text = getNodeText(block);
+            h.id = try self.generateId(text);
+            try result.append(self.a, h);
+        } else {
+            try result.append(self.a, block);
+        }
+    }
+    return result.toOwnedSlice(self.a);
+}
+
+fn closeSection(self: *Parser, info: *SectionInfo) !Node {
+    return .{ .tag = .section, .id = info.id, .level = info.level, .children = try info.children.toOwnedSlice(self.a), .attrs = info.attrs, .classes = info.classes };
+}
+
+fn generateId(self: *Parser, text: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .{};
+    var prev_hyphen = true;
+    for (text) |c| {
+        if (std.ascii.isAlphanumeric(c)) {
+            try buf.append(self.a, c);
+            prev_hyphen = false;
+        } else if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '-' or c == '_') {
+            if (!prev_hyphen and buf.items.len > 0) {
+                try buf.append(self.a, '-');
+                prev_hyphen = true;
+            }
+        }
+    }
+    while (buf.items.len > 0 and buf.items[buf.items.len - 1] == '-') _ = buf.pop();
+
+    var base_id = try buf.toOwnedSlice(self.a);
+    if (base_id.len == 0) {
+        base_id = try std.fmt.allocPrint(self.a, "s-{d}", .{self.shared.ids_used.count() + 1});
+    }
+
+    if (!self.shared.ids_used.contains(base_id)) {
+        try self.shared.ids_used.put(self.a, base_id, {});
+        return base_id;
+    }
+
+    var counter: usize = 1;
+    while (true) : (counter += 1) {
+        const candidate = try std.fmt.allocPrint(self.a, "{s}-{d}", .{ base_id, counter });
+        if (!self.shared.ids_used.contains(candidate)) {
+            try self.shared.ids_used.put(self.a, candidate, {});
+            return candidate;
+        }
+    }
+}
+
+fn resolveReferences(self: *Parser, nodes: []const Node) ![]const Node {
+    var result: std.ArrayList(Node) = .{};
+    for (nodes) |node| {
+        var n = node;
+        if ((n.tag == .link or n.tag == .image) and n.destination == null) {
+            if (n.reference) |ref| {
+                const raw_label = if (ref.len > 0) ref else (inline_mod.getPlainText(self.a, n) catch "");
+                const label = inline_mod.normalizeLabel(self.a, raw_label) catch raw_label;
+                if (self.shared.ref_defs.get(label)) |def| {
+                    n.destination = def.url;
+                    if (def.attrs) |ba| n = inline_mod.mergeRefAttrs(n, ba, self.a);
+                } else if (self.shared.auto_refs.get(label)) |dest| {
+                    n.destination = dest;
+                }
+            }
+        }
+        if (n.tag == .footnote_reference) {
+            const label = n.text;
+            var found = false;
+            for (self.shared.footnote_order.items) |existing| {
+                if (std.mem.eql(u8, existing, label)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try self.shared.footnote_order.append(self.a, label);
+            var fn_num: usize = 0;
+            for (self.shared.footnote_order.items, 1..) |existing, idx| {
+                if (std.mem.eql(u8, existing, label)) {
+                    fn_num = idx;
+                    break;
+                }
+            }
+            n.text = try std.fmt.allocPrint(self.a, "{d}", .{fn_num});
+            n.id = try std.fmt.allocPrint(self.a, "fnref{d}", .{fn_num});
+            n.destination = try std.fmt.allocPrint(self.a, "#fn{d}", .{fn_num});
+        }
+        if (n.children.len > 0) n.children = try self.resolveReferences(n.children);
+        try result.append(self.a, n);
+    }
+    return result.toOwnedSlice(self.a);
+}
+
+fn buildFootnoteSection(self: *Parser) !Node {
+    var items: std.ArrayList(Node) = .{};
+    var fn_idx: usize = 0;
+    while (fn_idx < self.shared.footnote_order.items.len) : (fn_idx += 1) {
+        const label = self.shared.footnote_order.items[fn_idx];
+        const raw_content = self.shared.footnote_defs.get(label) orelse &.{};
+        const content = try self.resolveReferences(raw_content);
+        const idx = items.items.len + 1;
+        const fn_id = try std.fmt.allocPrint(self.a, "fn{d}", .{idx});
+        const backref = try std.fmt.allocPrint(self.a, "#fnref{d}", .{idx});
+        var fn_children: std.ArrayList(Node) = .{};
+        const backlink = Node{
+            .tag = .link,
+            .destination = backref,
+            .text = "\u{21a9}\u{fe0e}",
+            .attrs = &.{.{ .key = "role", .value = "doc-backlink" }},
+        };
+        for (content, 0..) |block, bi| {
+            if (bi == content.len - 1 and block.tag == .para) {
+                var new_kids: std.ArrayList(Node) = .{};
+                for (block.children) |child| try new_kids.append(self.a, child);
+                try new_kids.append(self.a, backlink);
+                try fn_children.append(self.a, .{ .tag = .para, .children = try new_kids.toOwnedSlice(self.a) });
+            } else {
+                try fn_children.append(self.a, block);
+            }
+        }
+        if (content.len == 0 or content[content.len - 1].tag != .para) {
+            try fn_children.append(self.a, .{ .tag = .para, .children = try self.a.dupe(Node, &.{backlink}) });
+        }
+        try items.append(self.a, .{ .tag = .list_item, .id = fn_id, .children = try fn_children.toOwnedSlice(self.a) });
+    }
+    return .{ .tag = .footnote, .children = try items.toOwnedSlice(self.a), .attrs = &.{.{ .key = "role", .value = "doc-endnotes" }} };
+}
+
+// --- Utility functions ---
+
+pub fn isBlank(line: []const u8) bool {
+    for (line) |c| {
+        if (c != ' ' and c != '\t' and c != '\r') return false;
+    }
+    return true;
+}
+
+fn isNewBlockStart(line: []const u8) bool {
+    const trimmed = std.mem.trimLeft(u8, line, " \t");
+    if (trimmed.len == 0) return false;
+    if (trimmed[0] == '#') return true;
+    if (trimmed[0] == '>') return true;
+    if (isCodeFence(line) != null) return true;
+    if (parseBulletMarker(line) != null) return true;
+    if (parseOrderedMarker(line) != null) return true;
+    if (isThematicBreak(trimmed)) return true;
+    if (trimmed[0] == ':' and trimmed.len > 1 and (trimmed[1] == ' ' or trimmed[1] == '\t')) return true;
+    return false;
+}
+
+/// Visual indent width. Tabs count as 4 spaces per the djot spec.
+/// See also `countIndent` which counts only space characters.
+fn indentOf(line: []const u8) usize {
+    var n: usize = 0;
+    for (line) |c| {
+        if (c == ' ') {
+            n += 1;
+        } else if (c == '\t') {
+            n += 4;
+        } else break;
+    }
+    return n;
+}
+
+fn countIndent(line: []const u8) usize {
+    var n: usize = 0;
+    while (n < line.len and line[n] == ' ') : (n += 1) {}
+    return n;
+}
+
+fn countLeadingChar(line: []const u8, char: u8) usize {
+    for (line, 0..) |c, i| {
+        if (c != char) return i;
+    }
+    return line.len;
+}
+
+fn isThematicBreak(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len < 3) return false;
+    var count: usize = 0;
+    for (trimmed) |c| {
+        if (c == ' ') continue;
+        if (c != '*' and c != '-') return false;
+        count += 1;
+    }
+    return count >= 3;
+}
+
+const FenceInfo = struct { len: usize, char: u8, lang: ?[]const u8, indent: usize };
+
+fn isCodeFence(line: []const u8) ?FenceInfo {
+    var indent: usize = 0;
+    var rest = line;
+    while (rest.len > 0 and rest[0] == ' ') {
+        indent += 1;
+        rest = rest[1..];
+    }
+    if (rest.len < 3) return null;
+
+    const fence_char = rest[0];
+    if (fence_char != '`' and fence_char != '~') return null;
+    const fence_len = countLeadingChar(rest, fence_char);
+    if (fence_len < 3) return null;
+    const after_fence = std.mem.trim(u8, rest[fence_len..], " \t");
+
+    if (fence_char == '`') {
+        if (after_fence.len > 0) {
+            if (std.mem.indexOfScalar(u8, after_fence, ' ') != null) return null;
+            var bi: usize = 0;
+            while (bi < after_fence.len) : (bi += 1) {
+                if (after_fence[bi] == '`') {
+                    const back_run = countLeadingChar(after_fence[bi..], '`');
+                    if (back_run >= fence_len) return null;
+                    bi += back_run;
+                }
+            }
+        }
+    }
+    return .{ .len = fence_len, .char = fence_char, .lang = if (after_fence.len > 0) after_fence else null, .indent = indent };
+}
+
+fn startsBlockQuote(line: []const u8) bool {
+    const trimmed = std.mem.trimLeft(u8, line, " ");
+    if (trimmed.len == 0) return false;
+    if (trimmed[0] != '>') return false;
+    if (trimmed.len == 1) return true;
+    return trimmed[1] == ' ' or trimmed[1] == '\t';
+}
+
+fn stripBlockQuotePrefix(line: []const u8) []const u8 {
+    const trimmed = std.mem.trimLeft(u8, line, " ");
+    if (trimmed.len == 0) return "";
+    if (trimmed[0] != '>') return line;
+    if (trimmed.len == 1) return "";
+    if (trimmed[1] == ' ' or trimmed[1] == '\t') return trimmed[2..];
+    return trimmed[1..];
+}
+
+const DivInfo = struct { fence: []const u8, class: ?[]const u8 };
+
+fn isFencedDivStart(line: []const u8) ?DivInfo {
+    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const colons = countLeadingChar(trimmed, ':');
+    if (colons < 3) return null;
+    const after = std.mem.trim(u8, trimmed[colons..], " \t");
+    return .{ .fence = trimmed[0..colons], .class = if (after.len > 0) after else null };
+}
+
+fn getNodeText(node: Node) []const u8 {
+    if (node.text.len > 0) return node.text;
+    if (node.children.len == 0) return "";
+    var first: ?[*]const u8 = null;
+    var last_end: [*]const u8 = undefined;
+    for (node.children) |child| {
+        if (child.tag == .str and child.text.len > 0) {
+            if (first == null) first = child.text.ptr;
+            last_end = child.text.ptr + child.text.len;
+        }
+    }
+    if (first) |f| {
+        const len = @intFromPtr(last_end) - @intFromPtr(f);
+        return f[0..len];
+    }
+    return "";
+}
+
+fn mergeBlockAttrs(a: Allocator, existing: ?BlockAttrs, new_attrs: BlockAttrs) !BlockAttrs {
+    if (existing) |ex| return ex.merge(new_attrs, a);
+    return new_attrs;
+}
+
+const BulletInfo = struct { rest: []const u8, indent: usize, content_col: usize, marker: u8 };
+
+fn parseBulletMarker(line: []const u8) ?BulletInfo {
+    var indent: usize = 0;
+    while (indent < line.len and line[indent] == ' ') : (indent += 1) {}
+    const trimmed = line[indent..];
+    if (trimmed.len < 2) return null;
+    if (trimmed[0] != '-' and trimmed[0] != '+' and trimmed[0] != '*') return null;
+    if (trimmed[1] != ' ' and trimmed[1] != '\t') return null;
+    if (trimmed[0] == '-' or trimmed[0] == '*') {
+        if (isThematicBreak(line)) return null;
+    }
+    return .{ .rest = trimmed[2..], .indent = indent, .content_col = indent + 2, .marker = trimmed[0] };
+}
+
+const ListStyle = enum {
+    decimal,
+    lower_alpha,
+    upper_alpha,
+    lower_roman,
+    upper_roman,
+
+    fn htmlType(self: ListStyle) ?[]const u8 {
+        return switch (self) {
+            .decimal => null,
+            .lower_alpha => "a",
+            .upper_alpha => "A",
+            .lower_roman => "i",
+            .upper_roman => "I",
+        };
+    }
+};
+
+const OrderedInfo = struct {
+    rest: []const u8,
+    indent: usize,
+    content_col: usize,
+    start: usize,
+    style: ListStyle,
+    styles: [2]?ListStyle,
+    n_styles: u2,
+    marker_text: []const u8,
+};
+
+fn parseOrderedMarker(line: []const u8) ?OrderedInfo {
+    var indent: usize = 0;
+    while (indent < line.len and line[indent] == ' ') : (indent += 1) {}
+    const trimmed = line[indent..];
+    if (trimmed.len < 2) return null;
+
+    var paren_open = false;
+    var start: usize = 0;
+    if (trimmed[0] == '(') {
+        paren_open = true;
+        start = 1;
+    }
+    const after_paren = trimmed[start..];
+    if (after_paren.len == 0) return null;
+
+    var i: usize = 0;
+    while (i < after_paren.len and std.ascii.isDigit(after_paren[i])) : (i += 1) {}
+    if (i > 0 and i < after_paren.len) {
+        const delim = after_paren[i];
+        if ((!paren_open and (delim == '.' or delim == ')')) or (paren_open and delim == ')')) {
+            const marker_len = start + i + 1;
+            const num = std.fmt.parseInt(usize, after_paren[0..i], 10) catch 1;
+            return finishMarker(trimmed, indent, marker_len, num, .decimal, .decimal, after_paren[0..i]);
+        }
+    }
+
+    if (after_paren.len >= 2) {
+        const c = after_paren[0];
+        if (std.ascii.isLower(c)) {
+            const delim = after_paren[1];
+            if ((!paren_open and (delim == '.' or delim == ')')) or (paren_open and delim == ')')) {
+                const marker_len = start + 2;
+                if (isRomanLower(c)) {
+                    return finishMarker(trimmed, indent, marker_len, romanToNumber(&.{c}), .lower_roman, .lower_alpha, after_paren[0..1]);
+                } else {
+                    return finishMarker(trimmed, indent, marker_len, @as(usize, c - 'a') + 1, .lower_alpha, .lower_alpha, after_paren[0..1]);
+                }
+            }
+        }
+        if (std.ascii.isUpper(c)) {
+            const delim = after_paren[1];
+            if ((!paren_open and (delim == '.' or delim == ')')) or (paren_open and delim == ')')) {
+                const marker_len = start + 2;
+                if (isRomanUpper(c)) {
+                    return finishMarker(trimmed, indent, marker_len, romanToNumber(&.{c}), .upper_roman, .upper_alpha, after_paren[0..1]);
+                } else {
+                    return finishMarker(trimmed, indent, marker_len, @as(usize, c - 'A') + 1, .upper_alpha, .upper_alpha, after_paren[0..1]);
+                }
+            }
+        }
+        if (isRomanLower(c)) {
+            var j: usize = 0;
+            while (j < after_paren.len and isRomanLower(after_paren[j])) : (j += 1) {}
+            if (j > 1 and j < after_paren.len) {
+                const delim = after_paren[j];
+                if ((!paren_open and (delim == '.' or delim == ')')) or (paren_open and delim == ')')) {
+                    const marker_len = start + j + 1;
+                    const num = romanToNumber(after_paren[0..j]);
+                    return finishMarker(trimmed, indent, marker_len, num, .lower_roman, .lower_roman, after_paren[0..j]);
+                }
+            }
+        }
+        if (isRomanUpper(c)) {
+            var j: usize = 0;
+            while (j < after_paren.len and isRomanUpper(after_paren[j])) : (j += 1) {}
+            if (j > 1 and j < after_paren.len) {
+                const delim = after_paren[j];
+                if ((!paren_open and (delim == '.' or delim == ')')) or (paren_open and delim == ')')) {
+                    const marker_len = start + j + 1;
+                    const num = romanToNumber(after_paren[0..j]);
+                    return finishMarker(trimmed, indent, marker_len, num, .upper_roman, .upper_roman, after_paren[0..j]);
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+fn finishMarker(trimmed: []const u8, indent: usize, marker_len: usize, num: usize, style1: ListStyle, style2: ListStyle, marker_text: []const u8) ?OrderedInfo {
+    if (marker_len >= trimmed.len) {
+        return .{ .rest = "", .indent = indent, .content_col = indent + marker_len + 1, .start = num, .style = style1, .styles = .{ style1, if (style1 != style2) style2 else null }, .n_styles = if (style1 != style2) 2 else 1, .marker_text = marker_text };
+    }
+    if (trimmed[marker_len] != ' ' and trimmed[marker_len] != '\t') return null;
+    return .{ .rest = trimmed[marker_len + 1 ..], .indent = indent, .content_col = indent + marker_len + 1, .start = num, .style = style1, .styles = .{ style1, if (style1 != style2) style2 else null }, .n_styles = if (style1 != style2) 2 else 1, .marker_text = marker_text };
+}
+
+fn getListStart(marker_text: []const u8, style: ListStyle) usize {
+    return switch (style) {
+        .decimal => std.fmt.parseInt(usize, marker_text, 10) catch 1,
+        .lower_alpha => if (marker_text.len == 1) @as(usize, marker_text[0] - 'a') + 1 else 1,
+        .upper_alpha => if (marker_text.len == 1) @as(usize, marker_text[0] - 'A') + 1 else 1,
+        .lower_roman => romanToNumber(marker_text),
+        .upper_roman => romanToNumber(marker_text),
+    };
+}
+
+fn isRomanLower(c: u8) bool {
+    return switch (c) { 'i', 'v', 'x', 'l', 'c', 'd', 'm' => true, else => false };
+}
+
+fn isRomanUpper(c: u8) bool {
+    return switch (c) { 'I', 'V', 'X', 'L', 'C', 'D', 'M' => true, else => false };
+}
+
+fn romanToNumber(s: []const u8) usize {
+    var total: usize = 0;
+    var prev: usize = 0;
+    var i = s.len;
+    while (i > 0) {
+        i -= 1;
+        const n: usize = switch (s[i]) {
+            'i', 'I' => 1, 'v', 'V' => 5, 'x', 'X' => 10, 'l', 'L' => 50,
+            'c', 'C' => 100, 'd', 'D' => 500, 'm', 'M' => 1000, else => 0,
+        };
+        if (n < prev) { total -|= n; } else { total += n; }
+        prev = n;
+    }
+    return if (total > 0) total else 1;
+}
+
+fn isTableRow(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len < 1 or trimmed[0] != '|') return false;
+    var pipes: usize = 0;
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        if (trimmed[i] == '\\' and i + 1 < trimmed.len) {
+            i += 2;
+        } else if (trimmed[i] == '`') {
+            const ticks = inline_mod.parseInlineContent; // Need countRunAt
+            _ = ticks;
+            var run: usize = 0;
+            var j = i;
+            while (j < trimmed.len and trimmed[j] == '`') : (j += 1) run += 1;
+            const after = j;
+            var found_close = false;
+            var k = after;
+            while (k < trimmed.len) {
+                if (trimmed[k] == '`') {
+                    var r2: usize = 0;
+                    var m = k;
+                    while (m < trimmed.len and trimmed[m] == '`') : (m += 1) r2 += 1;
+                    if (r2 == run) {
+                        i = m;
+                        found_close = true;
+                        break;
+                    }
+                    k = m;
+                } else {
+                    k += 1;
+                }
+            }
+            if (!found_close) i = trimmed.len;
+        } else {
+            if (trimmed[i] == '|') pipes += 1;
+            i += 1;
+        }
+    }
+    return pipes >= 2;
+}
+
+fn isTableSep(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t|");
+    for (trimmed) |c| {
+        if (c != '-' and c != ':' and c != '|' and c != ' ') return false;
+    }
+    return trimmed.len > 0;
+}
+
+fn parseSepAligns(a: Allocator, line: []const u8) ![]const CellAlign {
+    var result: std.ArrayList(CellAlign) = .{};
+    const trimmed = std.mem.trim(u8, line, " \t");
+    var content = trimmed;
+    if (content.len > 0 and content[0] == '|') content = content[1..];
+    if (content.len > 0 and content[content.len - 1] == '|') content = content[0 .. content.len - 1];
+
+    var cell_iter = std.mem.splitScalar(u8, content, '|');
+    while (cell_iter.next()) |cell| {
+        const c = std.mem.trim(u8, cell, " \t");
+        if (c.len == 0) {
+            try result.append(a, .default);
+            continue;
+        }
+        const left_colon = c[0] == ':';
+        const right_colon = c[c.len - 1] == ':';
+        if (left_colon and right_colon) {
+            try result.append(a, .center);
+        } else if (right_colon) {
+            try result.append(a, .right);
+        } else if (left_colon) {
+            try result.append(a, .left);
+        } else {
+            try result.append(a, .default);
+        }
+    }
+    return result.toOwnedSlice(a);
+}
+
+fn splitTableCells(a: Allocator, content: []const u8) ![]const []const u8 {
+    var result: std.ArrayList([]const u8) = .{};
+    var i: usize = 0;
+    var cell_start: usize = 0;
+    while (i < content.len) {
+        if (content[i] == '\\' and i + 1 < content.len) {
+            i += 2;
+        } else if (content[i] == '`') {
+            var run: usize = 0;
+            var j = i;
+            while (j < content.len and content[j] == '`') : (j += 1) run += 1;
+            const after = j;
+            var found_close = false;
+            var k = after;
+            while (k < content.len) {
+                if (content[k] == '`') {
+                    var r2: usize = 0;
+                    var m = k;
+                    while (m < content.len and content[m] == '`') : (m += 1) r2 += 1;
+                    if (r2 == run) {
+                        i = m;
+                        found_close = true;
+                        break;
+                    }
+                    k = m;
+                } else {
+                    k += 1;
+                }
+            }
+            if (!found_close) i = content.len;
+        } else if (content[i] == '|') {
+            try result.append(a, content[cell_start..i]);
+            cell_start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    try result.append(a, content[cell_start..]);
+    return result.toOwnedSlice(a);
+}
