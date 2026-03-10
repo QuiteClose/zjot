@@ -1,5 +1,7 @@
 # zjot
 
+[![CI](https://github.com/QuiteClose/zjot/actions/workflows/ci.yml/badge.svg)](https://github.com/QuiteClose/zjot/actions/workflows/ci.yml)
+
 A [Djot](https://djot.net/) parser written in Zig. Produces HTML or AST output from Djot markup.
 
 zjot passes all 261 test cases from the canonical [djot.js](https://github.com/jgm/djot.js) test suite.
