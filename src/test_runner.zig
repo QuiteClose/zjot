@@ -177,11 +177,15 @@ test "djot test suite" {
 
         const dot = std.mem.lastIndexOfScalar(u8, filename, '.') orelse filename.len;
         const name = filename[0..dot];
-        std.debug.print("  {s}: {d}/{d} passed\n", .{ name, results.passed, results.total() });
+        if (results.failed > 0) {
+            std.debug.print("  {s}: {d}/{d} passed\n", .{ name, results.passed, results.total() });
+        }
         total.add(results);
     }
 
-    std.debug.print("\n  Total: {d}/{d} passed\n\n", .{ total.passed, total.total() });
+    if (total.failed > 0) {
+        std.debug.print("\n  Total: {d}/{d} passed\n\n", .{ total.passed, total.total() });
+    }
 
     // Don't fail the test -- we expect 0/261 initially.
     // Once the parser is complete, we'll change this to fail on any failure.
