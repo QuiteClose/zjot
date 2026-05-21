@@ -15,7 +15,7 @@ pub fn toHtml(a: Allocator, input: []const u8) ![]const u8 {
     var shared = Parser.SharedState{};
     var parser = Parser.init(aa, input, &shared);
     const doc = try parser.parseDoc();
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     try html.renderNode(aa, &out, doc);
     const result = try out.toOwnedSlice(aa);
     return a.dupe(u8, result);
@@ -33,7 +33,7 @@ pub fn toAstOpts(a: Allocator, input: []const u8, sourcepos: bool) ![]const u8 {
     var parser = Parser.init(aa, input, &shared);
     parser.track_pos = sourcepos;
     const doc = try parser.parseDoc();
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     try ast.renderAstNode(aa, &out, doc, 0, true);
     const result = try out.toOwnedSlice(aa);
     return a.dupe(u8, result);

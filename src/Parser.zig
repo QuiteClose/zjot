@@ -21,7 +21,7 @@ pub const SharedState = struct {
     auto_refs: std.StringArrayHashMapUnmanaged([]const u8) = .{},
     ids_used: std.StringArrayHashMapUnmanaged(void) = .{},
     footnote_defs: std.StringArrayHashMapUnmanaged([]const Node) = .{},
-    footnote_order: std.ArrayList([]const u8) = .{},
+    footnote_order: std.ArrayList([]const u8) = .empty,
 };
 
 pub const RefDef = struct {
@@ -49,8 +49,8 @@ pub fn init(a: Allocator, input: []const u8, shared: *SharedState) Parser {
 }
 
 fn splitLines(self: *Parser) !void {
-    var list: std.ArrayList([]const u8) = .{};
-    var offsets: std.ArrayList(u32) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
+    var offsets: std.ArrayList(u32) = .empty;
     var offset: u32 = 0;
     var it = std.mem.splitScalar(u8, self.input, '\n');
     while (it.next()) |line| {
@@ -95,7 +95,7 @@ pub fn parseDoc(self: *Parser) !Node {
     const resolved = try self.resolveReferences(with_sections);
 
     if (self.shared.footnote_order.items.len > 0) {
-        var all: std.ArrayList(Node) = .{};
+        var all: std.ArrayList(Node) = .empty;
         for (resolved) |n| try all.append(self.a, n);
         try all.append(self.a, try self.buildFootnoteSection());
         return .{ .tag = .section, .children = try all.toOwnedSlice(self.a) };
@@ -111,7 +111,7 @@ fn parseBlocksUntil(self: *Parser, end_marker: ?[]const u8) anyerror![]const Nod
     const prev_marker = self.end_marker;
     self.end_marker = end_marker;
     defer self.end_marker = prev_marker;
-    var children: std.ArrayList(Node) = .{};
+    var children: std.ArrayList(Node) = .empty;
     var pending_attrs: ?BlockAttrs = null;
 
     while (self.pos < self.lines.len) {
@@ -125,7 +125,7 @@ fn parseBlocksUntil(self: *Parser, end_marker: ?[]const u8) anyerror![]const Nod
 
         if (end_marker) |marker| {
             if (countLeadingChar(line, ':') >= marker.len and
-                isBlank(std.mem.trimLeft(u8, line, ":")))
+                isBlank(std.mem.trimStart(u8, line, ":")))
             {
                 self.pos += 1;
                 break;
@@ -190,7 +190,7 @@ fn tryBlockAttr(self: *Parser) !?BlockAttrs {
     }
 
     const indent = indentOf(line);
-    var full_text: std.ArrayList(u8) = .{};
+    var full_text: std.ArrayList(u8) = .empty;
     try full_text.appendSlice(self.a, trimmed);
     var lines_consumed: usize = 1;
 
@@ -214,17 +214,17 @@ fn tryBlockAttr(self: *Parser) !?BlockAttrs {
 
 fn isClosingFence(self: *const Parser, line: []const u8) bool {
     const marker = self.end_marker orelse return false;
-    return countLeadingChar(line, ':') >= marker.len and isBlank(std.mem.trimLeft(u8, line, ":"));
+    return countLeadingChar(line, ':') >= marker.len and isBlank(std.mem.trimStart(u8, line, ":"));
 }
 
 fn parseParagraph(self: *Parser) !Node {
     const para_start_line = self.pos;
-    var text_lines: std.ArrayList([]const u8) = .{};
+    var text_lines: std.ArrayList([]const u8) = .empty;
     while (self.pos < self.lines.len) {
         const line = self.lines[self.pos];
         if (isBlank(line)) break;
         if (self.isClosingFence(line)) break;
-        try text_lines.append(self.a, std.mem.trimLeft(u8, line, " \t"));
+        try text_lines.append(self.a, std.mem.trimStart(u8, line, " \t"));
         self.pos += 1;
     }
 
@@ -245,12 +245,12 @@ fn parseParagraph(self: *Parser) !Node {
 fn contentCol(self: *Parser, line_idx: usize) u32 {
     if (line_idx >= self.lines.len) return 1;
     const full_line = self.lines[line_idx];
-    const trimmed = std.mem.trimLeft(u8, full_line, " \t");
+    const trimmed = std.mem.trimStart(u8, full_line, " \t");
     return @intCast(full_line.len - trimmed.len + 1);
 }
 
 fn buildInlineLineMap(self: *Parser, text_lines: []const []const u8, start_line: usize) !LineMap {
-    var segs: std.ArrayList(LineMap.Segment) = .{};
+    var segs: std.ArrayList(LineMap.Segment) = .empty;
     var joined_pos: u32 = 0;
     for (text_lines, 0..) |line, i| {
         const orig_line_idx = start_line + i;
@@ -288,13 +288,13 @@ fn applyInlinePositions(nodes: []const Node, src: []const u8, line_map: LineMap)
 
 fn tryHeading(self: *Parser) !?Node {
     const line = self.lines[self.pos];
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     const hashes = countLeadingChar(trimmed, '#');
     if (hashes == 0 or hashes > 6) return null;
     if (hashes >= trimmed.len) {} else if (trimmed[hashes] != ' ' and trimmed[hashes] != '\t') return null;
 
     self.pos += 1;
-    var content_lines: std.ArrayList([]const u8) = .{};
+    var content_lines: std.ArrayList([]const u8) = .empty;
     const after_hashes = std.mem.trim(u8, trimmed[hashes..], " \t");
     if (after_hashes.len > 0) try content_lines.append(self.a, after_hashes);
 
@@ -306,7 +306,7 @@ fn tryHeading(self: *Parser) !?Node {
             break;
         if (parseBulletMarker(next) != null or parseOrderedMarker(next) != null) break;
         if (attrs_mod.tryParseBlockAttr(self.a, next) != null) break;
-        const next_trimmed = std.mem.trimLeft(u8, next, " ");
+        const next_trimmed = std.mem.trimStart(u8, next, " ");
         const next_hashes = countLeadingChar(next_trimmed, '#');
         if (next_hashes == hashes and next_hashes < next_trimmed.len and
             (next_trimmed[next_hashes] == ' ' or next_trimmed[next_hashes] == '\t'))
@@ -338,13 +338,13 @@ fn tryCodeBlock(self: *Parser) !?Node {
     const fence_info = isCodeFence(line) orelse return null;
     self.pos += 1;
 
-    var content: std.ArrayList(u8) = .{};
+    var content: std.ArrayList(u8) = .empty;
     while (self.pos < self.lines.len) {
         const l = self.lines[self.pos];
         self.pos += 1;
-        const close_char = countLeadingChar(std.mem.trimLeft(u8, l, " "), fence_info.char);
+        const close_char = countLeadingChar(std.mem.trimStart(u8, l, " "), fence_info.char);
         if (close_char >= fence_info.len and
-            isBlank(std.mem.trimLeft(u8, std.mem.trimLeft(u8, l, " ")[close_char..], &[_]u8{fence_info.char})))
+            isBlank(std.mem.trimStart(u8, std.mem.trimStart(u8, l, " ")[close_char..], &[_]u8{fence_info.char})))
         {
             break;
         }
@@ -369,7 +369,7 @@ fn tryBlockQuote(self: *Parser) !?Node {
     const line = self.lines[self.pos];
     if (!startsBlockQuote(line)) return null;
 
-    var inner_lines: std.ArrayList([]const u8) = .{};
+    var inner_lines: std.ArrayList([]const u8) = .empty;
     while (self.pos < self.lines.len) {
         const l = self.lines[self.pos];
         if (startsBlockQuote(l)) {
@@ -405,7 +405,7 @@ fn tryFencedDiv(self: *Parser) !?Node {
 
 fn tryRefDef(self: *Parser, pending_attrs: ?BlockAttrs) !?void {
     const line = self.lines[self.pos];
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     if (trimmed.len < 4 or trimmed[0] != '[') return null;
     const close_bracket = std.mem.indexOfScalar(u8, trimmed[1..], ']') orelse return null;
     if (close_bracket + 2 >= trimmed.len or trimmed[close_bracket + 2] != ':') return null;
@@ -414,13 +414,13 @@ fn tryRefDef(self: *Parser, pending_attrs: ?BlockAttrs) !?void {
     if (label.len > 0 and label[0] == '^') return null;
 
     self.pos += 1;
-    var dest_parts: std.ArrayList([]const u8) = .{};
+    var dest_parts: std.ArrayList([]const u8) = .empty;
     if (dest_text.len > 0) try dest_parts.append(self.a, dest_text);
     while (self.pos < self.lines.len) {
         const next = self.lines[self.pos];
         if (isBlank(next)) break;
         if (next.len == 0 or (next[0] != ' ' and next[0] != '\t')) break;
-        const next_trimmed = std.mem.trimLeft(u8, next, " ");
+        const next_trimmed = std.mem.trimStart(u8, next, " ");
         if (next_trimmed.len > 0 and next_trimmed[0] == '[') break;
         try dest_parts.append(self.a, std.mem.trim(u8, next, " \t"));
         self.pos += 1;
@@ -431,7 +431,7 @@ fn tryRefDef(self: *Parser, pending_attrs: ?BlockAttrs) !?void {
     } else if (dest_parts.items.len == 1) {
         dest_text = dest_parts.items[0];
     } else {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         for (dest_parts.items) |part| try buf.appendSlice(self.a, part);
         dest_text = try buf.toOwnedSlice(self.a);
     }
@@ -442,7 +442,7 @@ fn tryRefDef(self: *Parser, pending_attrs: ?BlockAttrs) !?void {
 
 fn tryFootnoteDef(self: *Parser) !?void {
     const line = self.lines[self.pos];
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     if (trimmed.len < 5 or !std.mem.startsWith(u8, trimmed, "[^")) return null;
     const close = std.mem.indexOfScalar(u8, trimmed[2..], ']') orelse return null;
     if (close + 3 >= trimmed.len or trimmed[close + 3] != ':') return null;
@@ -451,7 +451,7 @@ fn tryFootnoteDef(self: *Parser) !?void {
     const rest = std.mem.trim(u8, trimmed[close + 4 ..], " \t");
     self.pos += 1;
 
-    var content_lines: std.ArrayList([]const u8) = .{};
+    var content_lines: std.ArrayList([]const u8) = .empty;
     if (rest.len > 0) try content_lines.append(self.a, rest);
     while (self.pos < self.lines.len) {
         const l = self.lines[self.pos];
@@ -466,7 +466,7 @@ fn tryFootnoteDef(self: *Parser) !?void {
                 self.pos += 1;
             } else break;
         } else if (l.len > 0 and (l[0] == ' ' or l[0] == '\t')) {
-            try content_lines.append(self.a, std.mem.trimLeft(u8, l, " \t"));
+            try content_lines.append(self.a, std.mem.trimStart(u8, l, " \t"));
             self.pos += 1;
         } else break;
     }
@@ -488,11 +488,11 @@ const ItemContent = struct {
 
 fn collectItemContent(self: *Parser, content_col: usize, list_indent: usize, first_rest: []const u8) !ItemContent {
     var content = ItemContent{
-        .para_lines = .{},
-        .block_lines = .{},
+        .para_lines = .empty,
+        .block_lines = .empty,
         .item_saw_blank = false,
-        .para_orig_lines = .{},
-        .para_col_offsets = .{},
+        .para_orig_lines = .empty,
+        .para_col_offsets = .empty,
     };
 
     try content.para_lines.append(self.a, first_rest);
@@ -543,7 +543,7 @@ fn collectItemContent(self: *Parser, content_col: usize, list_indent: usize, fir
             continue;
         }
         if (!last_was_blank and !isNewBlockStart(next)) {
-            try content.block_lines.append(self.a, std.mem.trimLeft(u8, next, " \t"));
+            try content.block_lines.append(self.a, std.mem.trimStart(u8, next, " \t"));
             self.pos += 1;
             last_was_blank = false;
             continue;
@@ -557,7 +557,7 @@ fn collectItemContent(self: *Parser, content_col: usize, list_indent: usize, fir
 }
 
 fn parseItemContent(self: *Parser, content: *const ItemContent) ![]const Node {
-    var inner_blocks: std.ArrayList(Node) = .{};
+    var inner_blocks: std.ArrayList(Node) = .empty;
 
     const para_text = try inline_mod.joinLines(self.a, content.para_lines.items);
     if (para_text.len > 0) {
@@ -604,7 +604,7 @@ fn tryBulletList(self: *Parser) !?Node {
     const marker_char = first_info.marker;
     const list_start_line = self.pos;
 
-    var items: std.ArrayList(Node) = .{};
+    var items: std.ArrayList(Node) = .empty;
     var is_tight = true;
     var saw_blank_between = false;
 
@@ -685,7 +685,7 @@ fn tryOrderedList(self: *Parser) !?Node {
     var possible_styles: [2]?ListStyle = first_info.styles;
     var n_possible: u2 = first_info.n_styles;
 
-    var items: std.ArrayList(Node) = .{};
+    var items: std.ArrayList(Node) = .empty;
     var is_tight = true;
     var saw_blank_between = false;
 
@@ -745,7 +745,7 @@ fn tryOrderedList(self: *Parser) !?Node {
 
     const final_style = possible_styles[0] orelse .decimal;
     const resolved_start = getListStart(first_info.marker_text, final_style);
-    var ol_attrs: std.ArrayList(Attr) = .{};
+    var ol_attrs: std.ArrayList(Attr) = .empty;
     if (resolved_start != 1) {
         var start_buf: [20]u8 = undefined;
         const start_str = std.fmt.bufPrint(&start_buf, "{}", .{resolved_start}) catch "1";
@@ -768,14 +768,14 @@ fn tryOrderedList(self: *Parser) !?Node {
 
 fn tryDefinitionList(self: *Parser) !?Node {
     const line = self.lines[self.pos];
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     if (trimmed.len < 2 or trimmed[0] != ':' or (trimmed[1] != ' ' and trimmed[1] != '\t')) return null;
 
-    var items: std.ArrayList(Node) = .{};
+    var items: std.ArrayList(Node) = .empty;
 
     while (self.pos < self.lines.len) {
         const cur = self.lines[self.pos];
-        const cur_trimmed = std.mem.trimLeft(u8, cur, " ");
+        const cur_trimmed = std.mem.trimStart(u8, cur, " ");
         if (cur_trimmed.len < 2 or cur_trimmed[0] != ':' or (cur_trimmed[1] != ' ' and cur_trimmed[1] != '\t')) break;
 
         const marker_indent = @as(usize, @intCast(cur.len - cur_trimmed.len));
@@ -783,7 +783,7 @@ fn tryDefinitionList(self: *Parser) !?Node {
         const first_content = cur_trimmed[2..];
         self.pos += 1;
 
-        var content_lines: std.ArrayList([]const u8) = .{};
+        var content_lines: std.ArrayList([]const u8) = .empty;
         try content_lines.append(self.a, first_content);
 
         while (self.pos < self.lines.len) {
@@ -809,7 +809,7 @@ fn tryDefinitionList(self: *Parser) !?Node {
                 try content_lines.append(self.a, next[content_indent..]);
                 self.pos += 1;
             } else if (ni > marker_indent and ni < content_indent) {
-                try content_lines.append(self.a, std.mem.trimLeft(u8, next, " \t"));
+                try content_lines.append(self.a, std.mem.trimStart(u8, next, " \t"));
                 self.pos += 1;
             } else {
                 break;
@@ -830,7 +830,7 @@ fn tryDefinitionList(self: *Parser) !?Node {
             def_blocks = all_blocks;
         }
 
-        var item_children: std.ArrayList(Node) = .{};
+        var item_children: std.ArrayList(Node) = .empty;
         try item_children.append(self.a, term_node);
         try item_children.append(self.a, .{ .tag = .definition, .children = def_blocks });
         try items.append(self.a, .{ .tag = .definition_list_item, .children = try item_children.toOwnedSlice(self.a) });
@@ -844,7 +844,7 @@ fn tryTable(self: *Parser) !?Node {
     const line = self.lines[self.pos];
     if (!isTableRow(line)) return null;
 
-    var raw_rows: std.ArrayList([]const u8) = .{};
+    var raw_rows: std.ArrayList([]const u8) = .empty;
     while (self.pos < self.lines.len) {
         const l = self.lines[self.pos];
         if (!isTableRow(l)) break;
@@ -852,8 +852,8 @@ fn tryTable(self: *Parser) !?Node {
         self.pos += 1;
     }
 
-    var aligns: std.ArrayList([]const CellAlign) = .{};
-    var head_above: std.ArrayList(bool) = .{};
+    var aligns: std.ArrayList([]const CellAlign) = .empty;
+    var head_above: std.ArrayList(bool) = .empty;
     for (raw_rows.items) |r| {
         if (isTableSep(r)) {
             try aligns.append(self.a, try parseSepAligns(self.a, r));
@@ -864,7 +864,7 @@ fn tryTable(self: *Parser) !?Node {
         }
     }
 
-    var is_head_row: std.ArrayList(bool) = .{};
+    var is_head_row: std.ArrayList(bool) = .empty;
     for (raw_rows.items, 0..) |_, idx| {
         if (head_above.items[idx]) {
             try is_head_row.append(self.a, false);
@@ -874,7 +874,7 @@ fn tryTable(self: *Parser) !?Node {
         }
     }
 
-    var rows: std.ArrayList(Node) = .{};
+    var rows: std.ArrayList(Node) = .empty;
     var current_aligns: []const CellAlign = &.{};
     for (raw_rows.items, 0..) |r, idx| {
         if (head_above.items[idx]) {
@@ -889,12 +889,12 @@ fn tryTable(self: *Parser) !?Node {
         try rows.append(self.a, .{ .tag = .row, .children = cells });
     }
 
-    var cap_lines: std.ArrayList([]const u8) = .{};
+    var cap_lines: std.ArrayList([]const u8) = .empty;
     while (self.pos < self.lines.len) {
         var look = self.pos;
         while (look < self.lines.len and isBlank(self.lines[look])) : (look += 1) {}
         if (look >= self.lines.len) break;
-        const t = std.mem.trimLeft(u8, self.lines[look], " \t");
+        const t = std.mem.trimStart(u8, self.lines[look], " \t");
         if (t.len > 1 and t[0] == '^' and t[1] == ' ') {
             cap_lines.items.len = 0;
             self.pos = look;
@@ -910,7 +910,7 @@ fn tryTable(self: *Parser) !?Node {
         } else break;
     }
 
-    var table_children: std.ArrayList(Node) = .{};
+    var table_children: std.ArrayList(Node) = .empty;
     if (cap_lines.items.len > 0) {
         const cap_inlines = try inline_mod.parseInlines(self.a, cap_lines.items);
         try table_children.append(self.a, .{ .tag = .caption, .children = cap_inlines });
@@ -921,7 +921,7 @@ fn tryTable(self: *Parser) !?Node {
 }
 
 fn parseTableRowWithAlign(self: *Parser, line: []const u8, col_aligns: []const CellAlign, is_head: bool) ![]const Node {
-    var cells: std.ArrayList(Node) = .{};
+    var cells: std.ArrayList(Node) = .empty;
     const trimmed = std.mem.trim(u8, line, " \t");
     var content = trimmed;
     if (content.len > 0 and content[0] == '|') content = content[1..];
@@ -950,8 +950,8 @@ fn registerExplicitIds(self: *Parser, blocks: []const Node) !void {
 fn wrapSections(self: *Parser, blocks: []const Node) ![]const Node {
     try self.registerExplicitIds(blocks);
 
-    var result: std.ArrayList(Node) = .{};
-    var section_stack: std.ArrayList(SectionInfo) = .{};
+    var result: std.ArrayList(Node) = .empty;
+    var section_stack: std.ArrayList(SectionInfo) = .empty;
     defer section_stack.deinit(self.a);
 
     for (blocks) |block| {
@@ -1010,13 +1010,13 @@ fn wrapSections(self: *Parser, blocks: []const Node) ![]const Node {
 const SectionInfo = struct {
     level: u8 = 0,
     id: []const u8 = "",
-    children: std.ArrayList(Node) = .{},
+    children: std.ArrayList(Node) = .empty,
     attrs: []const Attr = &.{},
     classes: ?[]const u8 = null,
 };
 
 fn addHeadingIds(self: *Parser, blocks: []const Node) ![]const Node {
-    var result: std.ArrayList(Node) = .{};
+    var result: std.ArrayList(Node) = .empty;
     for (blocks) |block| {
         if (block.tag == .heading and block.id == null) {
             var h = block;
@@ -1035,7 +1035,7 @@ fn closeSection(self: *Parser, info: *SectionInfo) !Node {
 }
 
 fn generateId(self: *Parser, text: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     var prev_hyphen = true;
     for (text) |c| {
         if (std.ascii.isAlphanumeric(c)) {
@@ -1071,7 +1071,7 @@ fn generateId(self: *Parser, text: []const u8) ![]const u8 {
 }
 
 fn resolveReferences(self: *Parser, nodes: []const Node) ![]const Node {
-    var result: std.ArrayList(Node) = .{};
+    var result: std.ArrayList(Node) = .empty;
     for (nodes) |node| {
         var n = node;
         if ((n.tag == .link or n.tag == .image) and n.destination == null) {
@@ -1114,7 +1114,7 @@ fn resolveReferences(self: *Parser, nodes: []const Node) ![]const Node {
 }
 
 fn buildFootnoteSection(self: *Parser) !Node {
-    var items: std.ArrayList(Node) = .{};
+    var items: std.ArrayList(Node) = .empty;
     var fn_idx: usize = 0;
     while (fn_idx < self.shared.footnote_order.items.len) : (fn_idx += 1) {
         const label = self.shared.footnote_order.items[fn_idx];
@@ -1123,7 +1123,7 @@ fn buildFootnoteSection(self: *Parser) !Node {
         const idx = items.items.len + 1;
         const fn_id = try std.fmt.allocPrint(self.a, "fn{d}", .{idx});
         const backref = try std.fmt.allocPrint(self.a, "#fnref{d}", .{idx});
-        var fn_children: std.ArrayList(Node) = .{};
+        var fn_children: std.ArrayList(Node) = .empty;
         const backlink = Node{
             .tag = .link,
             .destination = backref,
@@ -1132,7 +1132,7 @@ fn buildFootnoteSection(self: *Parser) !Node {
         };
         for (content, 0..) |block, bi| {
             if (bi == content.len - 1 and block.tag == .para) {
-                var new_kids: std.ArrayList(Node) = .{};
+                var new_kids: std.ArrayList(Node) = .empty;
                 for (block.children) |child| try new_kids.append(self.a, child);
                 try new_kids.append(self.a, backlink);
                 try fn_children.append(self.a, .{ .tag = .para, .children = try new_kids.toOwnedSlice(self.a) });
@@ -1158,7 +1158,7 @@ pub fn isBlank(line: []const u8) bool {
 }
 
 fn isNewBlockStart(line: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, line, " \t");
+    const trimmed = std.mem.trimStart(u8, line, " \t");
     if (trimmed.len == 0) return false;
     if (trimmed[0] == '#') return true;
     if (trimmed[0] == '>') return true;
@@ -1243,7 +1243,7 @@ fn isCodeFence(line: []const u8) ?FenceInfo {
 }
 
 fn startsBlockQuote(line: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     if (trimmed.len == 0) return false;
     if (trimmed[0] != '>') return false;
     if (trimmed.len == 1) return true;
@@ -1251,7 +1251,7 @@ fn startsBlockQuote(line: []const u8) bool {
 }
 
 fn stripBlockQuotePrefix(line: []const u8) []const u8 {
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     if (trimmed.len == 0) return "";
     if (trimmed[0] != '>') return line;
     if (trimmed.len == 1) return "";
@@ -1262,7 +1262,7 @@ fn stripBlockQuotePrefix(line: []const u8) []const u8 {
 const DivInfo = struct { fence: []const u8, class: ?[]const u8 };
 
 fn isFencedDivStart(line: []const u8) ?DivInfo {
-    const trimmed = std.mem.trimLeft(u8, line, " ");
+    const trimmed = std.mem.trimStart(u8, line, " ");
     const colons = countLeadingChar(trimmed, ':');
     if (colons < 3) return null;
     const after = std.mem.trim(u8, trimmed[colons..], " \t");
@@ -1505,7 +1505,7 @@ fn isTableSep(line: []const u8) bool {
 }
 
 fn parseSepAligns(a: Allocator, line: []const u8) ![]const CellAlign {
-    var result: std.ArrayList(CellAlign) = .{};
+    var result: std.ArrayList(CellAlign) = .empty;
     const trimmed = std.mem.trim(u8, line, " \t");
     var content = trimmed;
     if (content.len > 0 and content[0] == '|') content = content[1..];
@@ -1534,7 +1534,7 @@ fn parseSepAligns(a: Allocator, line: []const u8) ![]const CellAlign {
 }
 
 fn splitTableCells(a: Allocator, content: []const u8) ![]const []const u8 {
-    var result: std.ArrayList([]const u8) = .{};
+    var result: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     var cell_start: usize = 0;
     while (i < content.len) {

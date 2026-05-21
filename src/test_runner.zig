@@ -35,14 +35,14 @@ fn countBackticks(line: []const u8) usize {
 }
 
 fn parseTestFile(a: Allocator, content: []const u8) ![]TestCase {
-    var cases: std.ArrayList(TestCase) = .{};
+    var cases: std.ArrayList(TestCase) = .empty;
     var lines = std.mem.splitScalar(u8, content, '\n');
     var line_num: usize = 0;
 
     while (true) {
         const raw = lines.next() orelse break;
         line_num += 1;
-        const line = std.mem.trimRight(u8, raw, "\r");
+        const line = std.mem.trimEnd(u8, raw, "\r");
 
         const fence = countBackticks(line);
         if (fence < 3) continue;
@@ -52,12 +52,12 @@ fn parseTestFile(a: Allocator, content: []const u8) ![]TestCase {
         const sourcepos = std.mem.indexOfScalar(u8, opts, 'p') != null;
         const start_line = line_num;
 
-        var input_buf: std.ArrayList(u8) = .{};
+        var input_buf: std.ArrayList(u8) = .empty;
         var sep_found = false;
 
         while (lines.next()) |r| {
             line_num += 1;
-            const l = std.mem.trimRight(u8, r, "\r");
+            const l = std.mem.trimEnd(u8, r, "\r");
             if (l.len == 1 and (l[0] == '.' or l[0] == '!')) {
                 sep_found = true;
                 break;
@@ -71,11 +71,11 @@ fn parseTestFile(a: Allocator, content: []const u8) ![]TestCase {
             break;
         }
 
-        var output_buf: std.ArrayList(u8) = .{};
+        var output_buf: std.ArrayList(u8) = .empty;
 
         while (lines.next()) |r| {
             line_num += 1;
-            const l = std.mem.trimRight(u8, r, "\r");
+            const l = std.mem.trimEnd(u8, r, "\r");
             if (countBackticks(l) >= fence) break;
             try output_buf.appendSlice(a, l);
             try output_buf.append(a, '\n');
@@ -93,11 +93,8 @@ fn parseTestFile(a: Allocator, content: []const u8) ![]TestCase {
     return try cases.toOwnedSlice(a);
 }
 
-fn runTestFile(a: Allocator, dir: std.fs.Dir, filename: []const u8) !TestResults {
-    const file = try dir.openFile(filename, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(a, 10 * 1024 * 1024);
+fn runTestFile(a: Allocator, io: std.Io, dir: std.Io.Dir, filename: []const u8) !TestResults {
+    const content = try std.Io.Dir.readFileAlloc(dir, io, filename, a, .limited(10 * 1024 * 1024));
     const cases = try parseTestFile(a, content);
 
     var results = TestResults{};
@@ -159,11 +156,12 @@ const test_file_names = [_][]const u8{
 };
 
 test "djot test suite" {
-    var test_dir = std.fs.cwd().openDir("test", .{}) catch |err| {
+    const io = std.testing.io;
+    var test_dir = std.Io.Dir.openDir(std.Io.Dir.cwd(), io, "test", .{}) catch |err| {
         std.debug.print("\nCould not open test directory: {}\n", .{err});
         return err;
     };
-    defer test_dir.close();
+    defer test_dir.close(io);
 
     var total = TestResults{};
 
@@ -171,7 +169,7 @@ test "djot test suite" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
 
-        const results = runTestFile(arena.allocator(), test_dir, filename) catch |err| {
+        const results = runTestFile(arena.allocator(), io, test_dir, filename) catch |err| {
             std.debug.print("  {s}: ERROR ({})\n", .{ filename, err });
             total.failed += 1;
             continue;
