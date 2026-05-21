@@ -54,7 +54,7 @@ pub fn build(
 ) Allocator.Error!LineMap {
     if (lines.len == 0) return .{};
 
-    var segs: std.ArrayList(Segment) = .{};
+    var segs: std.ArrayList(Segment) = .empty;
     var joined_pos: u32 = 0;
 
     for (lines, 0..) |line, i| {

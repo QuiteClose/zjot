@@ -14,8 +14,8 @@ pub const BlockAttrs = struct {
         var result = BlockAttrs{};
         result.id = other.id orelse self.id;
 
-        var merged: std.ArrayList(Attr) = .{};
-        var class_buf: std.ArrayList(u8) = .{};
+        var merged: std.ArrayList(Attr) = .empty;
+        var class_buf: std.ArrayList(u8) = .empty;
 
         for (self.attrs) |sa| {
             if (std.mem.eql(u8, sa.key, "class")) {
@@ -96,8 +96,8 @@ pub const AttrParser = struct {
             .begin = null,
             .lastpos = null,
             .result = .{},
-            .attrs_list = .{},
-            .value_buf = .{},
+            .attrs_list = .empty,
+            .value_buf = .empty,
             .current_key = null,
             .a = a,
         };
@@ -293,7 +293,7 @@ pub const AttrParser = struct {
 
     fn processEscapes(self: *AttrParser, raw: []const u8) []const u8 {
         if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         var i: usize = 0;
         while (i < raw.len) {
             if (raw[i] == '\\' and i + 1 < raw.len) {
@@ -310,8 +310,8 @@ pub const AttrParser = struct {
     pub fn finish(self: *AttrParser) BlockAttrs {
         var result = self.result;
         if (self.attrs_list.items.len > 0) {
-            var merged: std.ArrayList(Attr) = .{};
-            var class_buf: std.ArrayList(u8) = .{};
+            var merged: std.ArrayList(Attr) = .empty;
+            var class_buf: std.ArrayList(u8) = .empty;
             var class_inserted = false;
             for (self.attrs_list.items) |attr| {
                 if (std.mem.eql(u8, attr.key, "class")) {

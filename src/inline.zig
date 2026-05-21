@@ -29,8 +29,8 @@ const OpenerInfo = struct {
 };
 
 pub fn parseInlineContent(a: Allocator, src: []const u8) anyerror![]const Node {
-    var items: std.ArrayList(InlineItem) = .{};
-    var openers: std.ArrayList(OpenerInfo) = .{};
+    var items: std.ArrayList(InlineItem) = .empty;
+    var openers: std.ArrayList(OpenerInfo) = .empty;
     var pos: usize = 0;
     var text_start: usize = 0;
 
@@ -314,7 +314,7 @@ fn stripTrailingSpacesFromLastStr(items: *std.ArrayList(InlineItem)) void {
     switch (items.items[items.items.len - 1]) {
         .node => |*n| {
             if (n.tag == .str) {
-                n.text = std.mem.trimRight(u8, n.text, " \t");
+                n.text = std.mem.trimEnd(u8, n.text, " \t");
                 if (n.text.len == 0) _ = items.pop();
             }
         },
@@ -376,7 +376,7 @@ fn trimTrailingWhitespace(items: *std.ArrayList(InlineItem)) void {
         switch (items.items[items.items.len - 1]) {
             .node => |*n| {
                 if (n.tag == .str) {
-                    n.text = std.mem.trimRight(u8, n.text, " \t");
+                    n.text = std.mem.trimEnd(u8, n.text, " \t");
                     if (n.text.len == 0) {
                         _ = items.pop();
                         continue;
@@ -496,7 +496,7 @@ fn handleCloseBracket(a: Allocator, items: *std.ArrayList(InlineItem), openers: 
                 }
             }
 
-            var restored: std.ArrayList(InlineItem) = .{};
+            var restored: std.ArrayList(InlineItem) = .empty;
             const bracket_text: []const u8 = if (is_image) "![" else "[";
             try restored.append(a, .{ .node = .{ .tag = .str, .text = bracket_text } });
             for (children) |child| try restored.append(a, .{ .node = child });
@@ -690,7 +690,7 @@ fn handleSmartQuote(a: Allocator, items: *std.ArrayList(InlineItem), openers: *s
 }
 
 fn collectChildren(a: Allocator, items: *std.ArrayList(InlineItem), opener_idx: usize) ![]const Node {
-    var children: std.ArrayList(Node) = .{};
+    var children: std.ArrayList(Node) = .empty;
     for (items.items[opener_idx + 1 ..]) |item| {
         switch (item) {
             .node => |n| try children.append(a, n),
@@ -735,7 +735,7 @@ fn openerText(_: Allocator, op: OpenerInfo) ![]const u8 {
 }
 
 fn resolveItems(a: Allocator, items: []const InlineItem) ![]const Node {
-    var nodes: std.ArrayList(Node) = .{};
+    var nodes: std.ArrayList(Node) = .empty;
     for (items) |item| {
         switch (item) {
             .node => |n| try nodes.append(a, n),
@@ -785,7 +785,7 @@ fn applyAttrsToResolved(a: Allocator, nodes: *std.ArrayList(Node), ba: BlockAttr
                 }
             }
 
-            var span_children: std.ArrayList(Node) = .{};
+            var span_children: std.ArrayList(Node) = .empty;
             if (gather_start < nodes.items.len - 1 or word_start > 0) {
                 if (word_start > 0) {
                     const first_text = nodes.items[gather_start].text;
@@ -911,7 +911,7 @@ fn processUrl(a: Allocator, raw: []const u8) ![]const u8 {
     const needs_processing = std.mem.indexOfScalar(u8, raw, '\n') != null or
         std.mem.indexOfScalar(u8, raw, '\\') != null;
     if (!needs_processing) return raw;
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < raw.len) {
         if (raw[i] == '\n') {
@@ -933,7 +933,7 @@ pub fn normalizeLabel(a: Allocator, raw: []const u8) ![]const u8 {
         if (c == '\n' or c == '\r' or c == '\t') break true;
     } else false;
     if (!needs_normalization) return raw;
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     var in_ws = false;
     for (raw) |c| {
         if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
@@ -953,7 +953,7 @@ pub fn normalizeLabel(a: Allocator, raw: []const u8) ![]const u8 {
 
 pub fn getPlainText(a: Allocator, node: Node) ![]const u8 {
     if (node.text.len > 0) return node.text;
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     for (node.children) |child| {
         switch (child.tag) {
             .str => try buf.appendSlice(a, child.text),
@@ -1003,7 +1003,7 @@ pub fn mergeRefAttrs(node: Node, ref_attrs: BlockAttrs, a: Allocator) Node {
         if (result.attrs.len == 0) {
             result.attrs = ref_attrs.attrs;
         } else {
-            var merged: std.ArrayList(@import("node.zig").Attr) = .{};
+            var merged: std.ArrayList(@import("node.zig").Attr) = .empty;
             for (ref_attrs.attrs) |ra| {
                 var overridden = false;
                 for (result.attrs) |na| {
